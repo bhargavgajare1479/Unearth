@@ -319,9 +319,10 @@ colorama
 tqdm
 
 # GUI (Desktop)
-PyQt5
-PyQt5-Qt5
-PyQt5-sip
+PyQt6
+PyQt6-Qt6
+PyQt6-sip
+qtawesome
 
 # GUI (Web-based alternative)
 flask
