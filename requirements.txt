@@ -1,6 +1,5 @@
-# UnEarth Forensic Recovery Tool - Minimal Dependencies
+# UnEarth Forensic Recovery Tool - Dependencies
 # Python 3.11+ required
-# Core functionality only (no AI/ML)
 
 # ==========================================
 # GUI DEPENDENCIES
@@ -35,8 +34,11 @@ construct>=2.10.0
 # File type identification
 python-magic>=0.4.27
 
-# Metadata extraction
+# Metadata extraction (EXIF from images)
 Pillow>=10.0.0
+
+# PDF metadata extraction
+PyPDF2>=3.0.0
 
 # ==========================================
 # REPORTING
@@ -46,6 +48,12 @@ reportlab>=4.0.0
 
 # Excel export
 openpyxl>=3.1.0
+
+# ==========================================
+# OPTIONAL - Faster CRC32C (recommended)
+# ==========================================
+# Improves Btrfs checksum verification speed
+crc32c>=2.3
 
 # ==========================================
 # TESTING (Optional - Development)
@@ -63,11 +71,11 @@ openpyxl>=3.1.0
 #
 # Platform-specific dependencies:
 # - Linux: sudo apt-get install libmagic-dev python3-dev
-# - macOS: brew install libmagic
-# - Windows: No additional dependencies
+# - Fedora: sudo dnf install file-devel python3-devel
+# - Arch: sudo pacman -S file python
 #
 # Minimal (CLI only):
-#   pip install click rich psutil
+#   pip install click rich psutil python-magic Pillow PyPDF2
 #
 # Minimal (GUI only):
-#   pip install PyQt6 qtawesome psutil
+#   pip install PyQt6 qtawesome psutil python-magic Pillow PyPDF2

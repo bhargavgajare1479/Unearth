@@ -4,7 +4,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Status](https://img.shields.io/badge/status-active-success.svg)
 
-**Unearth** is a professional-grade forensic data recovery and analysis tool designed for digital forensics investigators, incident responders, and cybersecurity professionals. It specializes in recovering deleted files from **XFS** and **Btrfs** file systems with advanced AI-powered analysis capabilities.
+**Unearth** is a professional-grade forensic data recovery and analysis tool designed for digital forensics investigators, incident responders, and cybersecurity professionals. It specializes in recovering deleted files from **Btrfs** and **XFS** file systems using a combination of metadata analysis and file carving techniques.
 
 ## Features
 
@@ -12,9 +12,9 @@
 
 These features ensure maximum data retrieval and maintain the forensic integrity of all recovered files.
 
-- **Deleted File Recovery:** Employs a **dual-pronged approach** combining metadata analysis (parsing XFS/Btrfs B-trees for unlinked data) and signature-based **file carving** to guarantee the highest recovery rates, even when file system structures are lost.
-- **Multi-Format Support:** Leverages a robust database to identify and reconstruct **over 30 diverse file types** (documents, media, executables, etc.), maximizing the scope of recoverable evidence.
-- **Metadata Extraction:** Meticulously extracts and preserves critical file data (timestamps, inode numbers, permissions) and embedded information (author, camera data) essential for building a **forensic timeline**.
+- **Deleted File Recovery:** Employs a **dual-pronged approach** combining metadata analysis (parsing Btrfs/XFS B-trees for unlinked data) and signature-based **file carving** to guarantee the highest recovery rates, even when file system structures are lost.
+- **Multi-Format Support:** Leverages a robust signature database to identify and reconstruct **16+ diverse file types** (documents, images, audio, video, archives), maximizing the scope of recoverable evidence.
+- **Metadata Extraction:** Meticulously extracts and preserves critical file data (timestamps, inode numbers, permissions) and embedded information (EXIF camera data, PDF author info, Office document properties) essential for building a **forensic timeline**.
 - **File Integrity Verification:** Computes a unique **SHA256 hash** for every recovered file. This digital fingerprint serves to verify authenticity and maintain the crucial **chain of custody**.
 - **File Type Detection (Magic Numbers):** Performs rapid classification using file header signatures to ensure accurate identification, even if file extensions are lost or tampered with.
 
@@ -28,7 +28,7 @@ These features streamline the investigation process, making the final evidence r
 
 ### User Interfaces
 - **Command-Line Interface (CLI)**: Rich terminal interface with progress bars
-- **Graphical User Interface (GUI)**: PyQt5-based desktop application
+- **Graphical User Interface (GUI)**: PyQt6-based desktop application
 - **Python API**: Programmatic access for automation
 
 ## Architecture
@@ -39,18 +39,15 @@ unearth/
 │
 ├── src/
 │   ├── core/                    # Core recovery engines
-│   │   ├── xfs_parser.py       # XFS filesystem parser
 │   │   ├── btrfs_parser.py     # Btrfs filesystem parser
-│   │   └── file_carver.py      # File carving engine
-│   │
-│   ├── analysis/                # AI analysis modules
-│   │   ├── ai_classifier.py    # ML-based file classifier
-│   │   ├── anomaly_detector.py # Anomaly detection engine
-│   │   └── keyword_search.py   # NLP keyword search
+│   │   ├── xfs_parser.py       # XFS filesystem parser
+│   │   ├── file_carver.py      # File carving engine
+│   │   ├── metadata_extractor.py  # EXIF/PDF/Office metadata extraction
+│   │   └── partition_parser.py # Partition detection
 │   │
 │   ├── ui/                      # User interfaces
 │   │   ├── cli.py              # Command-line interface
-│   │   ├── gui.py              # Desktop GUI (PyQt5)
+│   │   ├── gui.py              # Desktop GUI (PyQt6)
 │   │   └── report_generator.py # Report generation
 │   │
 │   ├── app.py                   # Main application controller
@@ -60,22 +57,7 @@ unearth/
 │   ├── test_images/             # Test disk images
 │   └── recovered_output/        # Recovery output directory
 │
-├── docs/                        # Documentation
-│   ├── api.md
-│   ├── user_guide.md
-│   └── forensic_procedures.md
-│
-├── tests/                       # Test suite
-│   ├── test_core.py
-│   ├── test_analysis.py
-│   └── test_e2e.py
-│
-├── config/                      # Configuration files
-│   ├── config.json
-│   └── signatures.yaml
-│
 ├── logs/                        # Application logs
-├── .gitignore
 ├── README.md
 ├── requirements.txt
 ├── setup.py
@@ -113,7 +95,7 @@ sudo pacman -S --noconfirm \
     python \
     python-pip \
     python-setuptools \
-    libmagic \
+    file \
     base-devel \
     git
 ```
@@ -150,40 +132,7 @@ pip install -r requirements.txt
 python run.py
 ```
 
-### Optional: GPU Support
-
-For faster AI analysis with TensorFlow GPU:
-
-```bash
-# Install CUDA Toolkit (NVIDIA GPUs only)
-# Follow: https://developer.nvidia.com/cuda-downloads
-
-# Install GPU-enabled TensorFlow
-pip install tensorflow-gpu
-
-# Verify GPU detection
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
-```
-
 ## File System Support
-
-### XFS (Extended File System)
-
-**Support Level:** Full
-
-**Capabilities:**
-- Superblock parsing
-- AG (Allocation Group) analysis
-- Inode recovery (deleted and active)
-- B+tree directory traversal
-- Extended attributes extraction
-- Journal analysis (for timeline reconstruction)
-
-**Known Limitations:**
-- Large filesystem support (>16TB) may require additional memory
-- Heavily fragmented files may have partial recovery
-
-**Recovery Success Rate:** ~85-95% (depending on overwrite)
 
 ### Btrfs (B-Tree File System)
 
@@ -192,41 +141,38 @@ python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU')
 **Capabilities:**
 - Superblock and tree root parsing
 - COW (Copy-On-Write) tree traversal
-- Subvolume navigation
-- Snapshot analysis
-- Extent-based recovery
-- Checksum verification
+- FSID-based leaf node validation
+- Extent-based file data recovery
+- CRC32C checksum verification
+- File carving for deleted content
 
 **Known Limitations:**
-- Compressed extents require decompression (zlib, lzo, zstd)
+- Compressed extents (zlib, lzo, zstd) not yet decompressed
 - RAID configurations may need special handling
+- Deleted file metadata has narrow recovery window due to COW architecture
 
-**Recovery Success Rate:** ~80-90% (COW helps recovery)
+**Recovery Approach:** File carving (primary), metadata parsing (secondary)
 
-### Project Structure Guidelines
+### XFS (Extended File System)
 
-- **Modularity**: Each module should have a single responsibility
-- **Documentation**: All functions must have docstrings
-- **Type Hints**: Use type annotations for all function signatures
-- **Error Handling**: Use specific exceptions, avoid bare `except:`
-- **Logging**: Use structured logging, not print statements
+**Support Level:** Planned
 
-### Creating Test Disk Images
+**Capabilities:**
+- Superblock parsing
+- AG (Allocation Group) analysis
+- Inode recovery
+
+**Note:** XFS support is currently under development.
+
+## Creating Test Disk Images
 
 ```bash
-# Create XFS test image
-dd if=/dev/zero of=test_xfs.img bs=1M count=100
-mkfs.xfs test_xfs.img
-mkdir /mnt/test
-mount -o loop test_xfs.img /mnt/test
-# Add test files
-umount /mnt/test
-
 # Create Btrfs test image
 dd if=/dev/zero of=test_btrfs.img bs=1M count=100
 mkfs.btrfs test_btrfs.img
+mkdir /mnt/test
 mount -o loop test_btrfs.img /mnt/test
-# Add test files
+# Add test files, then delete some
 umount /mnt/test
 ```
 
@@ -277,26 +223,22 @@ The developers and contributors of Unearth:
 
 ## Acknowledgments
 
+- **Btrfs Developers** - For COW filesystem design and documentation
 - **XFS Development Team** - For filesystem documentation
-- **Btrfs Developers** - For COW filesystem design
 - **Sleuth Kit Team** - For forensic tool inspiration
-- **TensorFlow/PyTorch Teams** - For ML frameworks
 - **Open Source Community** - For amazing tools and libraries
 
-## Notes for cross-platform support
+## Platform Support
 
-### Currently we have selected Linux as the default platform due to following advantages
+### Linux (Primary Platform)
 
-- Native XFS/Btrfs support
+- Native Btrfs/XFS support
 - Raw disk access with proper permissions
 - Better performance for I/O operations
 - Most forensic tools available
 
 **Setup:**
 ```bash
-# Install kernel headers (for some dependencies)
-sudo apt-get install linux-headers-$(uname -r)
-
 # Grant user access to disk devices (use carefully!)
 sudo usermod -aG disk $USER
 ```
@@ -309,7 +251,6 @@ Unearth is free and open-source. If you find it useful:
 - **Report bugs** and suggest features
 - **Contribute** code or documentation
 - **Share** with your network
-- **Teach** others how to use it
 
 ## Final Words
 
@@ -323,4 +264,4 @@ We've built this tool with a passion for digital forensics and a commitment to t
 
 *Made with ❤️ by the Unearth Development Team*
 
-*Last Updated: October 3, 2025*
+*Last Updated: February 2026*
