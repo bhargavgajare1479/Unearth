@@ -22,21 +22,23 @@ class PartitionDetector:
     @staticmethod
     def get_all_partitions() -> List[Dict]:
         """
-        Get all disk partitions on the system
+        Get all disk partitions on the system (including unmounted ones)
         
         Returns:
             List of partition info dictionaries
         """
         partitions = []
+        seen_devices = set()
         
         try:
-            # Get all disk partitions
+            # First get mounted partitions from psutil
             for partition in psutil.disk_partitions(all=True):
                 part_info = {
                     'device': partition.device,
                     'mountpoint': partition.mountpoint,
                     'fstype': partition.fstype,
                     'opts': partition.opts,
+                    'mounted': True,
                 }
                 
                 # Get usage info if mounted
@@ -53,6 +55,71 @@ class PartitionDetector:
                     part_info['percent'] = 0
                 
                 partitions.append(part_info)
+                seen_devices.add(partition.device)
+            
+            # Now detect unmounted partitions using lsblk
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['lsblk', '-J', '-o', 'NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    import json
+                    data = json.loads(result.stdout)
+                    
+                    def process_device(dev, parent_name=None):
+                        dev_name = dev.get('name', '')
+                        dev_path = f"/dev/{dev_name}"
+                        dev_type = dev.get('type', '')
+                        fstype = dev.get('fstype', '') or ''
+                        mountpoint = dev.get('mountpoint', '') or ''
+                        
+                        # Only process partitions (not whole disks)
+                        if dev_type == 'part' and dev_path not in seen_devices:
+                            # This is an unmounted partition
+                            part_info = {
+                                'device': dev_path,
+                                'mountpoint': mountpoint if mountpoint else '(not mounted)',
+                                'fstype': fstype,
+                                'opts': '',
+                                'mounted': False,
+                                'label': dev.get('label', ''),
+                                'uuid': dev.get('uuid', ''),
+                                'size_str': dev.get('size', ''),
+                            }
+                            
+                            # Parse size from lsblk format (e.g., "14.9G")
+                            size_str = dev.get('size', '0')
+                            try:
+                                if 'G' in size_str:
+                                    part_info['total'] = int(float(size_str.replace('G', '')) * 1024**3)
+                                elif 'M' in size_str:
+                                    part_info['total'] = int(float(size_str.replace('M', '')) * 1024**2)
+                                elif 'T' in size_str:
+                                    part_info['total'] = int(float(size_str.replace('T', '')) * 1024**4)
+                                else:
+                                    part_info['total'] = 0
+                            except ValueError:
+                                part_info['total'] = 0
+                            
+                            part_info['used'] = 0
+                            part_info['free'] = part_info['total']
+                            part_info['percent'] = 0
+                            
+                            partitions.append(part_info)
+                            seen_devices.add(dev_path)
+                        
+                        # Process children (partitions of the disk)
+                        for child in dev.get('children', []):
+                            process_device(child, dev_name)
+                    
+                    for device in data.get('blockdevices', []):
+                        process_device(device)
+                        
+            except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
+                # lsblk not available or failed, continue with mounted partitions only
+                pass
                 
         except Exception as e:
             print(f"Error detecting partitions: {e}")
@@ -83,10 +150,21 @@ class PartitionDetector:
         
         Args:
             device_path: Path to device or image file
-            
+        
         Returns:
             Filesystem type ('xfs', 'btrfs', 'unknown')
         """
+        # Try using Btrfs parser for accurate detection
+        try:
+            from core.btrfs_parser import BtrfsParser
+            parser = BtrfsParser(device_path)
+            with parser:
+                if parser.detect_filesystem():
+                    return 'btrfs'
+        except Exception:
+            pass  # Fall back to manual detection
+    
+        # Manual magic number detection
         try:
             with open(device_path, 'rb') as f:
                 # Check XFS magic (XFSB at offset 0)
@@ -100,10 +178,10 @@ class PartitionDetector:
                 magic = f.read(8)
                 if magic == b'_BHRfS_M':
                     return 'btrfs'
-                
+            
         except (IOError, PermissionError) as e:
             print(f"Cannot read device {device_path}: {e}")
-        
+    
         return 'unknown'
     
     @staticmethod
@@ -490,6 +568,10 @@ if __name__ == "__main__":
         print(f"  Mount: {p['mountpoint']}")
         print(f"  Type: {p['fstype']}")
         print(f"  Size: {format_bytes(p['total'])}")
+        
+        # Test filesystem detection with parser
+        fs_detected = PartitionDetector.detect_filesystem_type(p['device'])
+        print(f"  Detected: {fs_detected}")
         print()
     
     print("=== External Drives ===")
@@ -498,4 +580,8 @@ if __name__ == "__main__":
         print(f"Device: {e['device']}")
         print(f"  Mount: {e['mountpoint']}")
         print(f"  Type: {e['fstype']}")
+        
+        # Test filesystem detection
+        fs_detected = PartitionDetector.detect_filesystem_type(e['device'])
+        print(f"  Detected: {fs_detected}")
         print()

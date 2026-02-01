@@ -8,16 +8,29 @@ import os
 from pathlib import Path
 from datetime import datetime
 import random
+from collections import Counter
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QTableWidget, QTableWidgetItem,
     QHeaderView, QLineEdit, QTextEdit, QComboBox, QCheckBox,
     QStackedWidget, QListWidget, QListWidgetItem, QFileDialog,
-    QMessageBox, QProgressBar, QDialog, QDialogButtonBox
+    QMessageBox, QProgressBar, QDialog, QDialogButtonBox, QScrollArea,
+    QGridLayout, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
+
+# Try to import matplotlib for charts
+try:
+    import matplotlib
+    matplotlib.use('QtAgg')
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("Warning: matplotlib not available, charts will be disabled")
 
 try:
     import qtawesome as qta
@@ -75,18 +88,29 @@ class ScanWorker(QThread):
     scan_completed = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
     
-    def __init__(self, app, session_id):
+    def __init__(self, app, session_id, file_filter="all"):
         super().__init__()
         self.app = app
         self.session_id = session_id
+        self.file_filter = file_filter  # "all", "deleted_only", or "active_only"
         
     def run(self):
         try:
-            self.progress_updated.emit(30, "Detecting filesystem...")
+            self.progress_updated.emit(10, "Detecting filesystem...")
             fs_type = self.app.detect_filesystem(self.session_id)
             
-            self.progress_updated.emit(60, "Recovering files...")
-            recovered = self.app.recover_deleted_files(self.session_id)
+            self.progress_updated.emit(20, f"Scanning filesystem (filter: {self.file_filter})...")
+            
+            def scan_progress(percent, msg):
+                # Map 0-100 scan progress to 20-90 overall progress
+                overall = 20 + int(percent * 0.7)
+                self.progress_updated.emit(overall, f"Scanning: {msg}")
+                
+            recovered = self.app.recover_deleted_files(
+                self.session_id, 
+                progress_callback=scan_progress,
+                file_filter=self.file_filter
+            )
             
             self.progress_updated.emit(90, "Carving files...")
             carved = self.app.carve_files(self.session_id)
@@ -147,6 +171,7 @@ class UnearthGUI(QMainWindow):
         self.recovered_files = []
         self.carved_files = []
         self.scan_worker = None
+        self.file_filter = "all"  # Filter: "all", "deleted_only", or "active_only"
         
         self.setup_ui()
         
@@ -163,10 +188,9 @@ class UnearthGUI(QMainWindow):
         msg.setInformativeText(
             "Some features may be limited:\n"
             "• Cannot access raw disk devices\n"
-            "• Cannot scan unmounted partitions\n\n"
-            "For full functionality:\n"
-            "• Linux/Mac: Run without sudo, app will request permissions when needed\n"
-            "• Windows: Run as normal user, app will request elevation when needed"
+            "• Scanning may be restricted\n\n"
+            "For full functionality, run with sudo:\n"
+            "  sudo python run.py"
         )
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
@@ -416,9 +440,14 @@ class UnearthGUI(QMainWindow):
         """)
         
         for p in partitions:
-            item_text = f"{p['device']} - {p['fstype'].upper()}"
-            if p.get('mountpoint'):
-                item_text += f" (Mounted: {p['mountpoint']})"
+            is_mounted = p.get('mounted', True)
+            mount_status = "🟢 Mounted" if is_mounted else "🔴 Unmounted"
+            
+            item_text = f"{p['device']} - {p['fstype'].upper()} [{mount_status}]"
+            if is_mounted and p.get('mountpoint') and p['mountpoint'] != '(not mounted)':
+                item_text += f"\n    📁 {p['mountpoint']}"
+            if p.get('label'):
+                item_text += f" ({p['label']})"
             item_text += f" - {format_bytes(p.get('total', 0))}"
             
             item = QListWidgetItem(item_text)
@@ -506,11 +535,11 @@ class UnearthGUI(QMainWindow):
             QMessageBox.critical(
                 self, "Permission Denied",
                 f"Cannot access: {source_path}\n\n"
-                "This usually means you need elevated permissions.\n"
-                "However, don't run the GUI with sudo.\n\n"
-                "Try:\n"
-                "1. Use disk image files (no special permissions needed)\n"
-                "2. Or grant read access: sudo chmod +r {source_path}"
+                "Root privileges are required to access raw disk devices.\n\n"
+                "Please restart the application using the launcher:\n"
+                "  sudo python run.py --gui\n\n"
+                "Alternatively, you can grant read access to the device:\n"
+                f"  sudo chmod +r {source_path}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start session:\n{str(e)}")
@@ -520,24 +549,25 @@ class UnearthGUI(QMainWindow):
         if not self.app or not self.current_session:
             return
         
-        self.scan_worker = ScanWorker(self.app, self.current_session)
+        self.scan_worker = ScanWorker(self.app, self.current_session, self.file_filter)
+        self.scan_worker.progress_updated.connect(self.update_progress)
         self.scan_worker.scan_completed.connect(self.scan_complete)
         self.scan_worker.error_occurred.connect(self.scan_error)
         self.scan_worker.start()
     
     def scan_complete(self, results):
-        """Handle scan completion"""
+        """Handle scan completion - update dashboard with results"""
         self.recovered_files = results.get('recovered', [])
         self.carved_files = results.get('carved', [])
         
-        QMessageBox.information(
-            self, "Scan Complete",
-            f"Recovery completed!\n\n"
-            f"Recovered: {len(self.recovered_files)}\n"
-            f"Carved: {len(self.carved_files)}\n"
-            f"Total: {len(self.recovered_files) + len(self.carved_files)}"
-        )
+        # Hide progress, show results in dashboard
+        self.progress_container.setVisible(False)
+        self.status_label.setText("Scan Complete!")
         
+        # Update dashboard stats and charts
+        self.update_dashboard_stats()
+        
+        # Also refresh the recovered files table for when user switches to that view
         self.refresh_recovered_files()
     
     def scan_error(self, error):
@@ -549,12 +579,29 @@ class UnearthGUI(QMainWindow):
         self.recovered_files = []
         for i in range(500):
             ext = random.choice(['jpg', 'pdf', 'mp4', 'mp3', 'zip', 'txt', 'docx'])
+            status = random.choice(['deleted', 'active', 'active'])  # More active than deleted
+            # Simulate realistic integrity distribution: 70% verified, 5% corrupted, 15% unverified, 10% no_checksum
+            integrity_roll = random.random()
+            if integrity_roll < 0.70:
+                integrity_status = 'verified'
+            elif integrity_roll < 0.75:
+                integrity_status = 'corrupted'
+            elif integrity_roll < 0.90:
+                integrity_status = 'unverified'
+            else:
+                integrity_status = 'no_checksum'
+                
             self.recovered_files.append({
-                'name': f'recovered_file_{i:04d}.{ext}',
+                'name': f'{"DELETED_" if status == "deleted" else "ACTIVE_"}file_{i:04d}.{ext}',
+                'original_name': f'file_{i:04d}.{ext}',
                 'size': random.randint(1024, 10485760),
                 'type': ext,
+                'status': status,
+                'integrity_status': integrity_status,
+                'integrity_verified': integrity_status == 'verified',
+                'integrity_details': f'CRC32C 0x{random.randbytes(4).hex().upper()}',
                 'modified': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'hash': f'sha256:{random.randbytes(16).hex()}'
+                'hash': f'sha256:{random.randbytes(32).hex()}'
             })
         
         self.carved_files = []
@@ -564,11 +611,18 @@ class UnearthGUI(QMainWindow):
                 'name': f'carved_file_{i:04d}.{ext}',
                 'size': random.randint(1024, 5242880),
                 'type': ext,
+                'status': 'carved',
+                'integrity_status': 'no_checksum',  # Carved files don't have filesystem checksums
+                'integrity_verified': False,
+                'integrity_details': 'Carved file (no filesystem checksum)',
                 'modified': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'hash': f'sha256:{random.randbytes(16).hex()}'
+                'hash': f'sha256:{random.randbytes(32).hex()}'
             })
         
-        self.current_session = 'demo_session'
+        self.current_session = 'demo_session_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Update dashboard with demo data
+        self.update_dashboard_stats()
         self.refresh_recovered_files()
     
     def update_dashboard(self, source_path, source_type):
@@ -579,30 +633,625 @@ class UnearthGUI(QMainWindow):
     # View Creators
     
     def create_dashboard_view(self):
-        """Create dashboard view"""
+        """Create dashboard view with stats and charts"""
         view = QWidget()
-        layout = QVBoxLayout(view)
-        layout.setContentsMargins(30, 25, 30, 30)
+        main_layout = QVBoxLayout(view)
+        main_layout.setContentsMargins(30, 25, 30, 30)
+        main_layout.setSpacing(20)
         
+        # Title
         title = QLabel("Dashboard")
         title.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
         title.setStyleSheet("color: #FFFFFF;")
-        layout.addWidget(title)
+        main_layout.addWidget(title)
         
-        welcome = QLabel(
+        # Scrollable content area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                background-color: #1E1E2E;
+                width: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #3A3F4A;
+                border-radius: 5px;
+            }
+        """)
+        
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setSpacing(20)
+        
+        # Welcome section (shown when no data)
+        self.welcome_section = QWidget()
+        welcome_layout = QVBoxLayout(self.welcome_section)
+        welcome_text = QLabel(
             "Welcome to UnEarth Forensic Recovery\n\n"
             "Click '+ Attach Source...' to begin recovery from:\n"
             "• Disk Image Files (.img, .raw, .dd, .e01)\n"
             "• System Partitions (XFS/Btrfs)\n"
             "• External Drives (USB with XFS/Btrfs)"
         )
-        welcome.setStyleSheet("color: #9CA3AF; font-size: 14px;")
-        welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        welcome.setMinimumHeight(400)
-        layout.addWidget(welcome)
+        welcome_text.setStyleSheet("color: #9CA3AF; font-size: 14px;")
+        welcome_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_layout.addWidget(welcome_text)
+        scroll_layout.addWidget(self.welcome_section)
         
-        layout.addStretch()
+        # Hidden filter widgets for backward compatibility
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItem("All Files (Active + Deleted)", "all")
+        self.filter_combo.hide()
+        
+        # Create dummy filter widgets (hidden) to prevent AttributeError
+        self.source_filter = QComboBox()
+        self.source_filter.addItem("📁 All Sources", "all")
+        self.source_filter.hide()
+        
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("📊 All Status", "all")
+        self.status_filter.hide()
+        
+        self.type_filter = QComboBox()
+        self.type_filter.addItem("📄 All Types", "all")
+        self.type_filter.hide()
+        
+        self.show_duplicates_check = QCheckBox()
+        self.show_duplicates_check.hide()
+        
+        
+        # Progress Section
+        self.progress_container = QWidget()
+        progress_layout = QVBoxLayout(self.progress_container)
+        
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 14px;")
+        progress_layout.addWidget(self.status_label)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #2A2F3A;
+                border-radius: 5px;
+                text-align: center;
+                background-color: #1E1E2E;
+                color: white;
+                min-height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: #3B82F6;
+            }
+        """)
+        self.progress_bar.setTextVisible(True)
+        progress_layout.addWidget(self.progress_bar)
+        
+        self.progress_container.setVisible(False)
+        scroll_layout.addWidget(self.progress_container)
+        
+        # Results Section (hidden until scan completes)
+        self.results_section = QWidget()
+        self.results_section.setVisible(False)
+        results_layout = QVBoxLayout(self.results_section)
+        results_layout.setSpacing(20)
+        
+        # --- Stats Cards Row ---
+        stats_row = QWidget()
+        stats_layout = QHBoxLayout(stats_row)
+        stats_layout.setSpacing(15)
+        
+        # Total Files Card
+        self.total_card = self._create_stat_card("Total Files", "0", "#3B82F6", "fa5s.folder-open")
+        stats_layout.addWidget(self.total_card)
+        
+        # Likely Deleted Files Card (was Deleted Files)
+        self.deleted_card = self._create_stat_card("Likely Deleted", "0", "#EF4444", "fa5s.trash")
+        stats_layout.addWidget(self.deleted_card)
+        
+        # Duplicates Card (was Active Files) - shows carved files matching active
+        self.active_card = self._create_stat_card("Duplicates", "0", "#6B7280", "fa5s.copy")
+        stats_layout.addWidget(self.active_card)
+        
+        # Carved Files Card
+        self.carved_card = self._create_stat_card("Carved Files", "0", "#F59E0B", "fa5s.search")
+        stats_layout.addWidget(self.carved_card)
+        
+        results_layout.addWidget(stats_row)
+        
+        # --- Charts Row ---
+        charts_row = QWidget()
+        charts_layout = QHBoxLayout(charts_row)
+        charts_layout.setSpacing(20)
+        
+        # File Status Chart (Pie)
+        self.status_chart_container = self._create_chart_card("File Status Distribution")
+        charts_layout.addWidget(self.status_chart_container)
+        
+        # File Type Chart (Pie)
+        self.type_chart_container = self._create_chart_card("File Types Breakdown")
+        charts_layout.addWidget(self.type_chart_container)
+        
+        # Integrity Verification Chart (Pie)
+        self.integrity_chart_container = self._create_chart_card("Integrity Verification")
+        charts_layout.addWidget(self.integrity_chart_container)
+        
+        results_layout.addWidget(charts_row)
+        
+        # --- Session Info Section ---
+        session_info = QFrame()
+        session_info.setStyleSheet("""
+            QFrame {
+                background-color: #1E1E2E;
+                border: 1px solid #2A2F3A;
+                border-radius: 10px;
+                padding: 15px;
+            }
+        """)
+        session_layout = QVBoxLayout(session_info)
+        
+        session_title = QLabel("Session Information")
+        session_title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        session_title.setStyleSheet("color: #FFFFFF; border: none;")
+        session_layout.addWidget(session_title)
+        
+        self.session_details = QLabel("No active session")
+        self.session_details.setStyleSheet("color: #9CA3AF; font-size: 12px; border: none;")
+        self.session_details.setWordWrap(True)
+        session_layout.addWidget(self.session_details)
+        
+        results_layout.addWidget(session_info)
+        
+        scroll_layout.addWidget(self.results_section)
+        scroll_layout.addStretch()
+        
+        scroll.setWidget(scroll_content)
+        main_layout.addWidget(scroll)
+        
         return view
+    
+    def _create_stat_card(self, title, value, color, icon_name):
+        """Create a statistics card widget"""
+        card = QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color: #1E1E2E;
+                border: 1px solid #2A2F3A;
+                border-radius: 12px;
+                border-left: 4px solid {color};
+            }}
+        """)
+        card.setMinimumWidth(180)
+        card.setMinimumHeight(100)
+        
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Title
+        title_label = QLabel(title)
+        title_label.setStyleSheet("color: #9CA3AF; font-size: 12px; font-weight: bold;")
+        layout.addWidget(title_label)
+        
+        # Value
+        value_label = QLabel(value)
+        value_label.setObjectName("value")
+        value_label.setFont(QFont("Segoe UI", 28, QFont.Weight.Bold))
+        value_label.setStyleSheet(f"color: {color};")
+        layout.addWidget(value_label)
+        
+        return card
+    
+    def _create_chart_card(self, title):
+        """Create a chart container card"""
+        card = QFrame()
+        card.setStyleSheet("""
+            QFrame {
+                background-color: #1E1E2E;
+                border: 1px solid #2A2F3A;
+                border-radius: 12px;
+            }
+        """)
+        card.setMinimumHeight(300)
+        
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Title
+        title_label = QLabel(title)
+        title_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        title_label.setStyleSheet("color: #FFFFFF; border: none;")
+        layout.addWidget(title_label)
+        
+        # Chart placeholder
+        chart_area = QWidget()
+        chart_area.setObjectName("chart_area")
+        chart_area.setMinimumHeight(250)
+        layout.addWidget(chart_area)
+        
+        return card
+    
+    def update_dashboard_stats(self):
+        """Update dashboard with current scan results"""
+        # Hide welcome, show results
+        self.welcome_section.setVisible(False)
+        self.results_section.setVisible(True)
+        
+        # Get session data
+        session = None
+        all_files = []
+        filtered_files = []
+        
+        if self.current_session and self.app:
+            session = self.app.sessions.get(self.current_session)
+            if session:
+                all_files = session.all_files or []
+                filtered_files = session.filtered_files or all_files
+        
+        # Calculate stats from session data
+        carved_count = sum(1 for f in all_files if f.get('source') == 'carved')
+        metadata_count = sum(1 for f in all_files if f.get('source') == 'metadata')
+        likely_deleted = sum(1 for f in all_files if f.get('status') == 'likely_deleted' or f.get('deleted'))
+        duplicates = sum(1 for f in all_files if f.get('is_duplicate', False))
+        
+        # Legacy stats for backward compatibility
+        deleted_count = sum(1 for f in self.recovered_files if f.get('status') == 'deleted' or f.get('deleted'))
+        active_count = sum(1 for f in self.recovered_files if f.get('status') == 'active')
+        total_recovered = len(all_files) if all_files else len(self.recovered_files) + len(self.carved_files)
+        
+        # Calculate integrity stats
+        verified_count = sum(1 for f in self.recovered_files if f.get('integrity_status') == 'verified')
+        corrupted_count = sum(1 for f in self.recovered_files if f.get('integrity_status') == 'corrupted')
+        unverified_count = sum(1 for f in self.recovered_files if f.get('integrity_status') == 'unverified')
+        no_checksum_count = sum(1 for f in self.recovered_files if f.get('integrity_status') == 'no_checksum')
+        
+        # Update stat cards with new categorization
+        self.total_card.findChild(QLabel, "value").setText(str(total_recovered))
+        self.deleted_card.findChild(QLabel, "value").setText(str(likely_deleted))
+        self.active_card.findChild(QLabel, "value").setText(str(duplicates))  # Show duplicates (active files in carved)
+        self.carved_card.findChild(QLabel, "value").setText(str(carved_count))
+        
+        # Update session details with filter info
+        total_size = sum(f.get('size', 0) for f in all_files)
+        filter_state = session.filter_state if session else {}
+        self.session_details.setText(
+            f"Session ID: {self.current_session[:16] if self.current_session else 'N/A'}...\n"
+            f"Showing: {len(filtered_files)}/{len(all_files)} files\n"
+            f"Total Size: {format_bytes(total_size)}\n"
+            f"Carved: {carved_count} | Metadata: {metadata_count}"
+        )
+        
+        # Update charts
+        self._update_status_chart(likely_deleted, duplicates, carved_count - duplicates - likely_deleted)
+        self._update_type_chart()
+        self._update_integrity_chart(verified_count, corrupted_count, unverified_count, no_checksum_count)
+    
+    def _update_status_chart(self, deleted, active, carved):
+        """Update the file status pie chart"""
+        if not HAS_MATPLOTLIB:
+            return
+            
+        # Clear previous chart
+        chart_area = self.status_chart_container.findChild(QWidget, "chart_area")
+        if chart_area:
+            # Remove old layout
+            old_layout = chart_area.layout()
+            if old_layout:
+                while old_layout.count():
+                    item = old_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            else:
+                old_layout = QVBoxLayout(chart_area)
+            
+            # Create pie chart
+            fig = Figure(figsize=(4, 3), dpi=100, facecolor='#1E1E2E')
+            canvas = FigureCanvas(fig)
+            ax = fig.add_subplot(111)
+            
+            labels = []
+            sizes = []
+            colors = []
+            
+            if deleted > 0:
+                labels.append(f'Deleted ({deleted})')
+                sizes.append(deleted)
+                colors.append('#EF4444')
+            if active > 0:
+                labels.append(f'Active ({active})')
+                sizes.append(active)
+                colors.append('#22C55E')
+            if carved > 0:
+                labels.append(f'Carved ({carved})')
+                sizes.append(carved)
+                colors.append('#F59E0B')
+            
+            if sizes:
+                wedges, texts, autotexts = ax.pie(
+                    sizes, labels=labels, colors=colors, autopct='%1.1f%%',
+                    startangle=90, textprops={'color': 'white', 'fontsize': 9}
+                )
+                for autotext in autotexts:
+                    autotext.set_color('white')
+            else:
+                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
+                       color='#9CA3AF', fontsize=14, transform=ax.transAxes)
+            
+            ax.set_facecolor('#1E1E2E')
+            fig.tight_layout()
+            
+            old_layout.addWidget(canvas)
+    
+    def _update_type_chart(self):
+        """Update the file type distribution chart"""
+        if not HAS_MATPLOTLIB:
+            return
+            
+        chart_area = self.type_chart_container.findChild(QWidget, "chart_area")
+        if chart_area:
+            # Remove old layout
+            old_layout = chart_area.layout()
+            if old_layout:
+                while old_layout.count():
+                    item = old_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            else:
+                old_layout = QVBoxLayout(chart_area)
+            
+            # Count file types
+            all_files = self.recovered_files + self.carved_files
+            type_counts = Counter(f.get('type', 'unknown') for f in all_files)
+            
+            # Create pie chart
+            fig = Figure(figsize=(4, 3), dpi=100, facecolor='#1E1E2E')
+            canvas = FigureCanvas(fig)
+            ax = fig.add_subplot(111)
+            
+            if type_counts:
+                # Get top 6 types, group rest as "Other"
+                sorted_types = type_counts.most_common(6)
+                if len(type_counts) > 6:
+                    other_count = sum(count for _, count in type_counts.most_common()[6:])
+                    sorted_types.append(('Other', other_count))
+                
+                labels = [f'{t} ({c})' for t, c in sorted_types]
+                sizes = [c for _, c in sorted_types]
+                colors = ['#3B82F6', '#8B5CF6', '#EC4899', '#14B8A6', '#F59E0B', '#6366F1', '#9CA3AF']
+                
+                wedges, texts, autotexts = ax.pie(
+                    sizes, labels=labels, colors=colors[:len(sizes)], autopct='%1.1f%%',
+                    startangle=90, textprops={'color': 'white', 'fontsize': 8}
+                )
+                for autotext in autotexts:
+                    autotext.set_color('white')
+            else:
+                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
+                       color='#9CA3AF', fontsize=14, transform=ax.transAxes)
+            
+            ax.set_facecolor('#1E1E2E')
+            fig.tight_layout()
+            
+            old_layout.addWidget(canvas)
+    
+    def _update_integrity_chart(self, verified, corrupted, unverified, no_checksum):
+        """Update the integrity verification pie chart"""
+        if not HAS_MATPLOTLIB:
+            return
+            
+        chart_area = self.integrity_chart_container.findChild(QWidget, "chart_area")
+        if chart_area:
+            # Remove old layout
+            old_layout = chart_area.layout()
+            if old_layout:
+                while old_layout.count():
+                    item = old_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            else:
+                old_layout = QVBoxLayout(chart_area)
+            
+            # Create pie chart
+            fig = Figure(figsize=(4, 3), dpi=100, facecolor='#1E1E2E')
+            canvas = FigureCanvas(fig)
+            ax = fig.add_subplot(111)
+            
+            # Collect non-zero counts
+            data = []
+            labels = []
+            colors = []
+            
+            if verified > 0:
+                data.append(verified)
+                labels.append(f'Verified ({verified})')
+                colors.append('#22C55E')  # Green
+            if corrupted > 0:
+                data.append(corrupted)
+                labels.append(f'Corrupted ({corrupted})')
+                colors.append('#EF4444')  # Red
+            if unverified > 0:
+                data.append(unverified)
+                labels.append(f'Unverified ({unverified})')
+                colors.append('#F59E0B')  # Yellow
+            if no_checksum > 0:
+                data.append(no_checksum)
+                labels.append(f'No Checksum ({no_checksum})')
+                colors.append('#6B7280')  # Gray
+            
+            if data:
+                wedges, texts, autotexts = ax.pie(
+                    data, labels=labels, colors=colors, autopct='%1.1f%%',
+                    startangle=90, textprops={'color': 'white', 'fontsize': 8}
+                )
+                for autotext in autotexts:
+                    autotext.set_color('white')
+            else:
+                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
+                       color='#9CA3AF', fontsize=14, transform=ax.transAxes)
+            
+            ax.set_facecolor('#1E1E2E')
+            fig.tight_layout()
+            
+            old_layout.addWidget(canvas)
+    
+    def _get_combo_style(self):
+        """Return consistent combo box styling"""
+        return """
+            QComboBox {
+                background-color: #2A2F3A;
+                color: #FFFFFF;
+                border: 1px solid #3A3F4A;
+                border-radius: 6px;
+                padding: 8px 15px;
+                min-width: 150px;
+                font-size: 13px;
+            }
+            QComboBox:hover {
+                border-color: #3B82F6;
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 10px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2A2F3A;
+                color: #FFFFFF;
+                selection-background-color: #3B82F6;
+                border: 1px solid #3A3F4A;
+            }
+        """
+    
+    def on_filter_changed(self, index):
+        """Handle legacy filter selection change"""
+        self.file_filter = self.filter_combo.currentData()
+
+    def on_dynamic_filter_changed(self):
+        """Handle dynamic filter changes - applies filters without re-scanning"""
+        if not self.current_session or not self.app:
+            return
+        
+        # Get current filter values
+        source = self.source_filter.currentData()
+        status = self.status_filter.currentData()
+        file_type = self.type_filter.currentData()
+        show_duplicates = self.show_duplicates_check.isChecked()
+        
+        # Apply filters through app
+        try:
+            filtered_files = self.app.apply_filters(
+                self.current_session,
+                source=source,
+                status=status,
+                file_type=file_type,
+                show_duplicates=show_duplicates
+            )
+            
+            # Refresh the file table with filtered results
+            self.refresh_recovered_files_from_filtered()
+            
+            # Update dashboard stats
+            self.update_dashboard_stats()
+            
+        except Exception as e:
+            self.logger.error(f"Filter error: {e}")
+    
+    def refresh_recovered_files_from_filtered(self):
+        """Refresh file table using session.filtered_files"""
+        if not self.current_session:
+            return
+        
+        session = self.app.sessions.get(self.current_session)
+        if not session:
+            return
+        
+        # Use filtered files if available, otherwise all files
+        files = session.filtered_files if session.filtered_files else session.all_files
+        
+        self.file_table.setRowCount(0)
+        
+        for file_info in files:
+            row = self.file_table.rowCount()
+            self.file_table.insertRow(row)
+            
+            # Name
+            name = file_info.get('name', 'Unknown')
+            name_item = QTableWidgetItem(name)
+            self.file_table.setItem(row, 0, name_item)
+            
+            # Size
+            size = file_info.get('size', 0)
+            size_str = self._format_size(size)
+            size_item = QTableWidgetItem(size_str)
+            self.file_table.setItem(row, 1, size_item)
+            
+            # Type
+            file_type = file_info.get('type', '')
+            type_item = QTableWidgetItem(file_type.upper() if file_type else 'Unknown')
+            self.file_table.setItem(row, 2, type_item)
+            
+            # Source (new column)
+            source = file_info.get('source', 'unknown')
+            if source == 'carved':
+                source_text = "🔍 Carved"
+                source_color = "#F59E0B"
+            else:
+                source_text = "📋 Metadata"
+                source_color = "#3B82F6"
+            source_item = QTableWidgetItem(source_text)
+            source_item.setForeground(QColor(source_color))
+            self.file_table.setItem(row, 3, source_item)
+            
+            # Status (new column)
+            status = file_info.get('status', 'unknown')
+            if file_info.get('deleted', False):
+                status_text = "🗑️ Deleted"
+                status_color = "#EF4444"
+            elif file_info.get('is_duplicate', False):
+                status_text = "📋 Active (Dup)"
+                status_color = "#6B7280"
+            elif status == 'likely_deleted':
+                status_text = "❓ Likely Deleted"
+                status_color = "#F59E0B"
+            elif status == 'active':
+                status_text = "✅ Active"
+                status_color = "#22C55E"
+            else:
+                status_text = "❓ Unknown"
+                status_color = "#9CA3AF"
+            status_item = QTableWidgetItem(status_text)
+            status_item.setForeground(QColor(status_color))
+            self.file_table.setItem(row, 4, status_item)
+            
+            # Path
+            path = file_info.get('path', '')
+            path_item = QTableWidgetItem(str(path))
+            self.file_table.setItem(row, 5, path_item)
+        
+        # Update row count label
+        if hasattr(self, 'file_count_label'):
+            total = len(session.all_files) if session.all_files else 0
+            shown = len(files)
+            self.file_count_label.setText(f"Showing {shown} of {total} files")
+    
+    def _format_size(self, size_bytes):
+        """Format file size for display"""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+    def update_progress(self, percent, message):
+        """Update progress bar"""
+        self.progress_container.setVisible(True)
+        self.progress_bar.setValue(percent)
+        self.status_label.setText(message)
+
     
     def create_recovered_files_view(self):
         """Create recovered files view"""
@@ -631,10 +1280,10 @@ class UnearthGUI(QMainWindow):
         search.textChanged.connect(self.filter_files)
         layout.addWidget(search)
         
-        # Table
+        # Table - Updated columns for source/status display
         self.file_table = QTableWidget()
-        self.file_table.setColumnCount(5)
-        self.file_table.setHorizontalHeaderLabels(['Name', 'Size', 'Type', 'Modified', 'Hash'])
+        self.file_table.setColumnCount(6)
+        self.file_table.setHorizontalHeaderLabels(['Name', 'Size', 'Type', 'Source', 'Status', 'Path'])
         self.file_table.horizontalHeader().setStretchLastSection(True)
         self.file_table.setStyleSheet("""
             QTableWidget {
@@ -668,12 +1317,39 @@ class UnearthGUI(QMainWindow):
         self.file_table.setRowCount(len(all_files))
         
         for i, f in enumerate(all_files):
-            self.file_table.setItem(i, 0, QTableWidgetItem(f.get('name', '')))
-            self.file_table.setItem(i, 1, QTableWidgetItem(format_bytes(f.get('size', 0))))
-            self.file_table.setItem(i, 2, QTableWidgetItem(f.get('type', '')))
-            self.file_table.setItem(i, 3, QTableWidgetItem(f.get('modified', '')))
+            # Status column with color coding
+            status = f.get('status', 'unknown')
+            status_item = QTableWidgetItem(status.upper())
+            if status == 'deleted':
+                status_item.setForeground(QColor('#EF4444'))  # Red for deleted
+            elif status == 'active':
+                status_item.setForeground(QColor('#22C55E'))  # Green for active
+            else:
+                status_item.setForeground(QColor('#9CA3AF'))  # Gray for unknown/carved
+            self.file_table.setItem(i, 0, status_item)
+            
+            # Integrity column with verification status
+            integrity = f.get('integrity_status', 'unverified')
+            if integrity == 'verified':
+                integrity_item = QTableWidgetItem('✓ VERIFIED')
+                integrity_item.setForeground(QColor('#22C55E'))  # Green
+            elif integrity == 'corrupted':
+                integrity_item = QTableWidgetItem('✗ CORRUPTED')
+                integrity_item.setForeground(QColor('#EF4444'))  # Red
+            elif integrity == 'unverified':
+                integrity_item = QTableWidgetItem('? UNVERIFIED')
+                integrity_item.setForeground(QColor('#F59E0B'))  # Yellow
+            else:  # no_checksum
+                integrity_item = QTableWidgetItem('- N/A')
+                integrity_item.setForeground(QColor('#6B7280'))  # Gray
+            self.file_table.setItem(i, 1, integrity_item)
+            
+            self.file_table.setItem(i, 2, QTableWidgetItem(f.get('name', '')))
+            self.file_table.setItem(i, 3, QTableWidgetItem(format_bytes(f.get('size', 0))))
+            self.file_table.setItem(i, 4, QTableWidgetItem(f.get('type', '')))
+            self.file_table.setItem(i, 5, QTableWidgetItem(f.get('modified', '')))
             hash_val = f.get('hash', '')
-            self.file_table.setItem(i, 4, QTableWidgetItem(hash_val[:20] + '...' if len(hash_val) > 20 else hash_val))
+            self.file_table.setItem(i, 6, QTableWidgetItem(hash_val[:20] + '...' if len(hash_val) > 20 else hash_val))
     
     def filter_files(self, text):
         """Filter files table"""

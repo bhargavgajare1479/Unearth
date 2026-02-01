@@ -202,12 +202,15 @@ def analyze(image_path):
 @click.argument('output_dir', type=click.Path())
 @click.option('--filesystem', '-f', type=click.Choice(['xfs', 'btrfs', 'auto']), default='auto',
               help='Filesystem type (auto-detect if not specified)')
+@click.option('--filter', 'file_filter', type=click.Choice(['all', 'deleted_only', 'active_only']), default='all',
+              help='Filter files to recover: all (default), deleted_only, or active_only')
 @click.option('--carve/--no-carve', default=True, help='Enable file carving')
 @click.option('--hash-algorithm', '-h', type=click.Choice(['md5', 'sha256']), default='sha256',
               help='Hash algorithm for integrity verification')
-def recover(image_path, output_dir, filesystem, carve, hash_algorithm):
+def recover(image_path, output_dir, filesystem, file_filter, carve, hash_algorithm):
     """Recover deleted files from disk image"""
     console.print(f"\n[bold cyan]Starting Recovery Operation[/bold cyan]\n")
+    console.print(f"[bold]File Filter:[/bold] {file_filter}\n")
     
     if not BACKEND_AVAILABLE:
         console.print("[red]Error: Backend not available[/red]")
@@ -236,9 +239,9 @@ def recover(image_path, output_dir, filesystem, carve, hash_algorithm):
             fs_type = app.detect_filesystem(session_id)
             progress.update(task, advance=15)
             
-            # Recover files
-            progress.update(task, description="[cyan]Recovering deleted files...")
-            recovered = app.recover_deleted_files(session_id)
+            # Recover files with filter
+            progress.update(task, description=f"[cyan]Recovering files (filter: {file_filter})...")
+            recovered = app.recover_deleted_files(session_id, file_filter=file_filter)
             progress.update(task, advance=40)
             
             # Carve files
@@ -254,17 +257,65 @@ def recover(image_path, output_dir, filesystem, carve, hash_algorithm):
         # Display results
         console.print("\n[bold green]✓ Recovery Complete[/bold green]\n")
         
+        # Count deleted vs active files
+        deleted_count = sum(1 for f in recovered if f.get('status') == 'deleted')
+        active_count = sum(1 for f in recovered if f.get('status') == 'active')
+        
         summary = Table(title="Recovery Summary", box=box.ROUNDED)
         summary.add_column("Metric", style="cyan bold")
         summary.add_column("Count", style="white", justify="right")
         
-        summary.add_row("Recovered Files", str(len(recovered)))
+        summary.add_row("Total Recovered", str(len(recovered)))
+        summary.add_row("  └─ [red]Deleted Files[/red]", f"[red]{deleted_count}[/red]")
+        summary.add_row("  └─ [green]Active Files[/green]", f"[green]{active_count}[/green]")
         summary.add_row("Carved Files", str(len(carved)))
-        summary.add_row("Total Files", str(len(recovered) + len(carved)))
         summary.add_row("Filesystem", fs_type.value.upper())
+        summary.add_row("Filter Applied", file_filter)
         summary.add_row("Hash Algorithm", hash_algorithm.upper())
         
         console.print(summary)
+        
+        # Integrity Verification Summary
+        verified_count = sum(1 for f in recovered if f.get('integrity_status') == 'verified')
+        corrupted_count = sum(1 for f in recovered if f.get('integrity_status') == 'corrupted')
+        unverified_count = sum(1 for f in recovered if f.get('integrity_status') == 'unverified')
+        no_checksum_count = sum(1 for f in recovered if f.get('integrity_status') == 'no_checksum')
+        
+        if len(recovered) > 0:
+            console.print("\n[bold cyan]Integrity Verification[/bold cyan]")
+            
+            integrity_table = Table(box=box.SIMPLE)
+            integrity_table.add_column("Status", style="bold")
+            integrity_table.add_column("Count", justify="right")
+            integrity_table.add_column("Percentage", justify="right")
+            
+            total = len(recovered)
+            if verified_count > 0:
+                integrity_table.add_row(
+                    "[green]✓ Verified[/green]", 
+                    str(verified_count), 
+                    f"{verified_count/total*100:.1f}%"
+                )
+            if corrupted_count > 0:
+                integrity_table.add_row(
+                    "[red]✗ Corrupted[/red]", 
+                    str(corrupted_count), 
+                    f"{corrupted_count/total*100:.1f}%"
+                )
+            if unverified_count > 0:
+                integrity_table.add_row(
+                    "[yellow]? Unverified[/yellow]", 
+                    str(unverified_count), 
+                    f"{unverified_count/total*100:.1f}%"
+                )
+            if no_checksum_count > 0:
+                integrity_table.add_row(
+                    "[dim]- No Checksum[/dim]", 
+                    str(no_checksum_count), 
+                    f"{no_checksum_count/total*100:.1f}%"
+                )
+            
+            console.print(integrity_table)
         
         console.print(f"\n[bold]Session ID:[/bold] {session_id}")
         console.print(f"[bold]Output Directory:[/bold] {output_dir}\n")

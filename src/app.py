@@ -7,7 +7,6 @@ forensic recovery operations across XFS and Btrfs file systems.
 Author: Unearth Development Team
 Version: 1.0.0
 """
-
 import logging
 import json
 from pathlib import Path
@@ -15,6 +14,7 @@ from typing import Optional, Dict, List, Any
 from datetime import datetime
 from enum import Enum
 import hashlib
+from core.btrfs_parser import BtrfsParser
 
 
 class FileSystemType(Enum):
@@ -43,9 +43,19 @@ class RecoverySession:
         self.output_dir = output_dir
         self.created_at = datetime.now()
         self.fs_type = FileSystemType.UNKNOWN
-        self.recovered_files = []
-        self.carved_files = []
+        self.recovered_files = []  # From metadata parser
+        self.carved_files = []     # From file carver
+        self.all_files = []        # Combined list for filtering (carved + metadata)
+        self.filtered_files = []   # Currently displayed after filtering
         self.metadata = {}
+        
+        # Filter state for dynamic filtering
+        self.filter_state = {
+            'source': 'all',           # 'all', 'carved', 'metadata'
+            'status': 'all',           # 'all', 'deleted', 'active', 'unknown'
+            'file_type': 'all',        # 'all' or specific extension
+            'show_duplicates': False,  # Whether to show duplicate carved files
+        }
         
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to dictionary for serialization"""
@@ -57,7 +67,10 @@ class RecoverySession:
             "fs_type": self.fs_type.value,
             "recovered_files_count": len(self.recovered_files),
             "carved_files_count": len(self.carved_files),
-            "metadata": self.metadata
+            "all_files_count": len(self.all_files),
+            "filtered_files_count": len(self.filtered_files),
+            "metadata": self.metadata,
+            "filter_state": self.filter_state
         }
 
 
@@ -140,7 +153,11 @@ class UnearthApp:
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
         
-        # Configure logger
+        # Configure root logger to capture ALL module logs
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+        
+        # Configure unearth logger specifically
         logger = logging.getLogger("unearth")
         logger.setLevel(log_level)
         
@@ -161,6 +178,11 @@ class UnearthApp:
         file_handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
         
+        # Add handlers to root logger (captures all modules)
+        root_logger.addHandler(file_handler)
+        root_logger.addHandler(console_handler)
+        
+        # Also add to unearth logger
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
         
@@ -219,7 +241,46 @@ class UnearthApp:
         
         self.logger.info(f"Detecting filesystem for session {session_id}")
         
-        # Read magic bytes from image
+        # Try Btrfs parser first
+        try:
+            btrfs_parser = BtrfsParser(str(session.image_path))
+            with btrfs_parser:
+                if btrfs_parser.detect_filesystem():
+                    session.fs_type = FileSystemType.BTRFS
+                    self.logger.info("Detected Btrfs filesystem using parser")
+                    return FileSystemType.BTRFS
+        except Exception as e:
+            self.logger.debug(f"Btrfs detection failed: {e}")
+        
+        if session.fs_type == FileSystemType.UNKNOWN:
+            try:
+                from core.partition_parser import PartitionTableParser
+                partition_parser = PartitionTableParser(str(session.image_path))
+                partitions = partition_parser.parse()
+                
+                if partitions:
+                    self.logger.info(f"Found {len(partitions)} partitions")
+                    
+                    # Try to detect filesystem in each partition
+                    for partition in partitions:
+                        self.logger.info(f"Checking partition {partition.index}: offset={partition.offset}, size={partition.size}")
+                        
+                        # Try Btrfs with offset
+                        try:
+                            btrfs_parser = BtrfsParser(str(session.image_path), offset=partition.offset)
+                            with btrfs_parser:
+                                if btrfs_parser.detect_filesystem():
+                                    session.fs_type = FileSystemType.BTRFS
+                                    session.metadata['partition_offset'] = partition.offset
+                                    self.logger.info(f"Detected Btrfs filesystem in partition {partition.index}")
+                                    return FileSystemType.BTRFS
+                        except Exception as e:
+                            self.logger.debug(f"Partition {partition.index} check failed: {e}")
+                            
+            except Exception as e:
+                self.logger.error(f"Partition detection failed: {e}")
+
+        # Fallback to manual detection for other filesystems (raw)
         try:
             with open(session.image_path, 'rb') as f:
                 # XFS magic: 0x58465342 at offset 0
@@ -227,30 +288,35 @@ class UnearthApp:
                 magic = f.read(4)
                 if magic == b'XFSB':
                     session.fs_type = FileSystemType.XFS
-                    self.logger.info(f"Detected XFS filesystem")
+                    self.logger.info("Detected XFS filesystem")
                     return FileSystemType.XFS
                 
-                # Btrfs magic: "_BHRfS_M" at offset 0x10040
+                # Btrfs magic: "_BHRfS_M" at offset 0x10040 (backup check)
                 f.seek(0x10040)
                 magic = f.read(8)
                 if magic == b'_BHRfS_M':
                     session.fs_type = FileSystemType.BTRFS
-                    self.logger.info(f"Detected Btrfs filesystem")
+                    self.logger.info("Detected Btrfs filesystem (manual)")
                     return FileSystemType.BTRFS
                 
         except Exception as e:
             self.logger.error(f"Filesystem detection failed: {e}")
         
         session.fs_type = FileSystemType.UNKNOWN
-        self.logger.warning(f"Unknown filesystem type")
+        self.logger.warning("Unknown filesystem type")
         return FileSystemType.UNKNOWN
     
-    def recover_deleted_files(self, session_id: str) -> List[Dict[str, Any]]:
+    def recover_deleted_files(self, session_id: str, progress_callback=None, file_filter: str = "all") -> List[Dict]:
         """
         Recover deleted files from the disk image.
         
         Args:
             session_id: Session identifier
+            progress_callback: Optional callback function for progress updates (percent, message)
+            file_filter: Filter for which files to recover:
+                - "all": Recover all files found (default)
+                - "deleted_only": Only recover deleted files
+                - "active_only": Only recover active/existing files
             
         Returns:
             List of recovered file metadata
@@ -263,7 +329,7 @@ class UnearthApp:
         if not session:
             raise KeyError(f"Session not found: {session_id}")
         
-        self.logger.info(f"Starting file recovery for session {session_id}")
+        self.logger.info(f"Starting file recovery for session {session_id} (filter: {file_filter})")
         
         # Detect filesystem if not already done
         if session.fs_type == FileSystemType.UNKNOWN:
@@ -279,10 +345,23 @@ class UnearthApp:
             # recovered_files = self.xfs_parser.recover_deleted()
             
         elif session.fs_type == FileSystemType.BTRFS:
-            self.logger.info("Using Btrfs parser (to be implemented)")
-            # self.btrfs_parser = BtrfsParser(session.image_path)
-            # recovered_files = self.btrfs_parser.recover_deleted()
-            
+            self.logger.info("Using Btrfs parser")
+            try:
+                offset = session.metadata.get('partition_offset', 0)
+                
+                # Adapter for raw (current, total, msg) -> (percent, msg)
+                def parser_callback(curr, total, msg):
+                    if progress_callback and total > 0:
+                        percent = int((curr / total) * 100)
+                        progress_callback(percent, msg)
+                
+                self.btrfs_parser = BtrfsParser(str(session.image_path), offset=offset, progress_callback=parser_callback)
+                with self.btrfs_parser:
+                    recovered_files = self.btrfs_parser.recover_deleted_files(session.output_dir, file_filter=file_filter)
+                self.logger.info(f"Btrfs parser recovered {len(recovered_files)} files")
+            except Exception as e:
+                self.logger.error(f"Btrfs recovery failed: {e}")
+                recovered_files = []
         else:
             raise NotImplementedError(f"Parser not available for {session.fs_type.value}")
         
@@ -310,14 +389,143 @@ class UnearthApp:
         
         self.logger.info(f"Starting file carving for session {session_id}")
         
-        # TODO: Initialize file carver (will be implemented in next module)
-        # self.file_carver = FileCarver(session.image_path, session.output_dir)
-        # carved_files = self.file_carver.carve(file_types)
+        from core.file_carver import FileCarver
         
-        carved_files = []
+        self.file_carver = FileCarver(str(session.image_path), session.output_dir)
+        carved_files = self.file_carver.carve(file_types)
+        
         session.carved_files = carved_files
         self.logger.info(f"Carved {len(carved_files)} files")
+        
+        # After carving, combine and deduplicate
+        self.deduplicate_and_combine(session_id)
+        
         return carved_files
+    
+    def deduplicate_and_combine(self, session_id: str) -> None:
+        """
+        Combine recovered and carved files, marking duplicates.
+        
+        Deduplication logic:
+        - Compute hash of metadata-recovered files (active ones)
+        - Mark carved files with matching hash as duplicates
+        - Combine all files into session.all_files
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+        
+        import hashlib
+        
+        # Build hash set from metadata-recovered files that are active (not deleted)
+        active_hashes = set()
+        for f in session.recovered_files:
+            # Check if file has hash, if not compute from path
+            file_hash = f.get('hash')
+            if not file_hash and f.get('path') and os.path.exists(f.get('path', '')):
+                try:
+                    with open(f['path'], 'rb') as fp:
+                        file_hash = hashlib.sha256(fp.read(65536)).hexdigest()
+                        f['hash'] = file_hash
+                except Exception:
+                    pass
+            
+            # If file is active (not deleted), add to active set
+            if file_hash and not f.get('deleted', False):
+                active_hashes.add(file_hash)
+            
+            # Ensure source field
+            f['source'] = 'metadata'
+            f['is_duplicate'] = False
+        
+        # Mark carved files as duplicates if they match active files
+        duplicates_found = 0
+        for f in session.carved_files:
+            file_hash = f.get('hash')
+            if file_hash and file_hash in active_hashes:
+                f['is_duplicate'] = True
+                f['status'] = 'active'  # It's a copy of an active file
+                duplicates_found += 1
+            else:
+                f['is_duplicate'] = False
+                f['status'] = 'likely_deleted'  # Not matching active = likely deleted
+        
+        self.logger.info(f"Deduplication: {duplicates_found} carved files match active files")
+        
+        # Combine all files
+        session.all_files = []
+        session.all_files.extend(session.recovered_files)
+        session.all_files.extend(session.carved_files)
+        
+        # Apply current filter
+        self.apply_filters(session_id)
+    
+    def apply_filters(self, session_id: str, 
+                      source: Optional[str] = None,
+                      status: Optional[str] = None,
+                      file_type: Optional[str] = None,
+                      show_duplicates: Optional[bool] = None) -> List[Dict[str, Any]]:
+        """
+        Apply filters to all_files and update filtered_files.
+        Does NOT re-scan - just filters existing results.
+        
+        Args:
+            session_id: Session identifier
+            source: 'all', 'carved', or 'metadata'
+            status: 'all', 'deleted', 'active', 'likely_deleted', or 'unknown'
+            file_type: 'all' or specific extension (e.g., 'pdf', 'jpg')
+            show_duplicates: Whether to include duplicate carved files
+            
+        Returns:
+            Filtered list of files
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return []
+        
+        # Update filter state if provided
+        if source is not None:
+            session.filter_state['source'] = source
+        if status is not None:
+            session.filter_state['status'] = status
+        if file_type is not None:
+            session.filter_state['file_type'] = file_type
+        if show_duplicates is not None:
+            session.filter_state['show_duplicates'] = show_duplicates
+        
+        fs = session.filter_state
+        filtered = []
+        
+        for f in session.all_files:
+            # Source filter
+            if fs['source'] != 'all' and f.get('source') != fs['source']:
+                continue
+            
+            # Status filter
+            file_status = f.get('status', 'unknown')
+            if f.get('deleted', False):
+                file_status = 'deleted'
+            elif f.get('is_duplicate', False):
+                file_status = 'active'
+                
+            if fs['status'] != 'all' and file_status != fs['status']:
+                continue
+            
+            # File type filter
+            if fs['file_type'] != 'all':
+                file_ext = f.get('type', '') or os.path.splitext(f.get('name', ''))[1].lower().strip('.')
+                if file_ext != fs['file_type']:
+                    continue
+            
+            # Duplicate filter
+            if not fs['show_duplicates'] and f.get('is_duplicate', False):
+                continue
+            
+            filtered.append(f)
+        
+        session.filtered_files = filtered
+        self.logger.debug(f"Filter applied: {len(filtered)}/{len(session.all_files)} files shown")
+        return filtered
     
     def analyze_files(self, session_id: str, enable_ai: bool = True) -> Dict[str, Any]:
         """

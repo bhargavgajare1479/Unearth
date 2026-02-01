@@ -142,13 +142,9 @@ def interactive_mode():
     while True:
         choice = input("Enter your choice (1-3): ").strip()
         if choice == '1':
-            if not is_root():
-                relaunch_with_sudo()
             launch_gui()
             break
         elif choice == '2':
-            if not is_root():
-                relaunch_with_sudo()
             launch_cli()
             break
         elif choice == '3':
@@ -171,13 +167,16 @@ def main():
 
     args = parser.parse_args()
 
+    # Check for root permissions FIRST, before showing any menu
+    if not is_root():
+        print_banner()
+        print("⚠️  UnEarth requires root privileges for disk access.\n")
+        relaunch_with_sudo()
+    
+    # Now we are running as root - proceed with normal flow
     if args.cli:
-        if not is_root():
-            relaunch_with_sudo()
         launch_cli()
     elif args.gui:
-        if not is_root():
-            relaunch_with_sudo()
         launch_gui()
     else:
         interactive_mode()
