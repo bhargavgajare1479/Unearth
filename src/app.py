@@ -9,11 +9,15 @@ Version: 1.0.0
 """
 import logging
 import json
+import os
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 from enum import Enum
 import hashlib
+import zipfile
+import re
+import xml.etree.ElementTree as ET
 from core.btrfs_parser import BtrfsParser
 
 
@@ -103,7 +107,7 @@ class UnearthApp:
         self.file_carver = None
         self.ai_classifier = None
         self.anomaly_detector = None
-        self.keyword_search = None
+        self.keyword_searcher = None  # Renamed to avoid shadowing keyword_search() method
         self.report_generator = None
         
         self.logger.info("Unearth application initialized")
@@ -562,6 +566,269 @@ class UnearthApp:
         
         self.logger.info(f"Analysis complete for session {session_id}")
         return analysis_results
+    
+    def _extract_text_lines(self, filepath: str, file_type: str) -> List[str]:
+        """
+        Extract searchable text lines from a file based on its format.
+        
+        Supports:
+        - PDF files: extracts text per page using PyPDF2
+        - DOCX files: unzips and parses word/document.xml
+        - ODT/ODS files: unzips and parses content.xml
+        - XLSX files: unzips and parses shared strings + sheet data
+        - Plain text: reads as UTF-8 line by line
+        
+        Args:
+            filepath: absolute path to the file
+            file_type: file extension/type (e.g. 'pdf', 'zip', 'jpg')
+            
+        Returns:
+            List of text lines extracted from the file.
+            Returns empty list if the file can't be read or is unsupported binary.
+        """
+        ext = file_type.lower().strip('.')
+        
+        # Also check the actual file extension (carved files may have wrong type)
+        actual_ext = os.path.splitext(filepath)[1].lower().strip('.')
+        
+        # --- PDF extraction via PyPDF2 ---
+        if ext == 'pdf' or actual_ext == 'pdf':
+            return self._extract_pdf_text(filepath)
+        
+        # --- DOCX / ODT / XLSX extraction via ZIP + XML ---
+        # These are all ZIP archives containing XML files with the actual text
+        if ext in ('zip', 'docx', 'odt', 'ods', 'xlsx') or \
+           actual_ext in ('docx', 'odt', 'ods', 'xlsx'):
+            return self._extract_office_text(filepath, actual_ext or ext)
+        
+        # --- Plain text fallback ---
+        # Skip known binary formats that can never contain readable text
+        binary_formats = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'webp',
+                         'heic', 'mp3', 'mp4', 'avi', 'mp3_id3', '7z', 'rar'}
+        if ext in binary_formats or actual_ext in binary_formats:
+            return []
+        
+        return self._extract_plaintext(filepath)
+    
+    def _extract_pdf_text(self, filepath: str) -> List[str]:
+        """Extract text from a PDF file using PyPDF2."""
+        lines = []
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(filepath)
+            for page_num, page in enumerate(reader.pages, start=1):
+                page_text = page.extract_text()
+                if page_text:
+                    # Split into lines and add page context
+                    for line in page_text.splitlines():
+                        stripped = line.strip()
+                        if stripped:  # skip blank lines
+                            lines.append(stripped)
+        except ImportError:
+            self.logger.debug("PyPDF2 not installed — PDF content search disabled")
+        except Exception as e:
+            self.logger.debug(f"Could not extract PDF text from {filepath}: {e}")
+        return lines
+    
+    def _extract_office_text(self, filepath: str, ext: str) -> List[str]:
+        """
+        Extract text from Office/ODF documents by reading their internal XML.
+        
+        DOCX → word/document.xml (Office Open XML)
+        ODT/ODS → content.xml (OpenDocument Format)
+        XLSX → xl/sharedStrings.xml + xl/worksheets/sheet*.xml
+        """
+        lines = []
+        try:
+            with zipfile.ZipFile(filepath, 'r') as zf:
+                names = zf.namelist()
+                
+                # --- DOCX: Microsoft Word ---
+                if 'word/document.xml' in names:
+                    xml_data = zf.read('word/document.xml')
+                    # Strip XML tags to get plain text
+                    text = self._strip_xml_tags(xml_data.decode('utf-8', errors='ignore'))
+                    lines.extend(line.strip() for line in text.splitlines() if line.strip())
+                
+                # --- ODT/ODS: LibreOffice / OpenDocument ---
+                elif 'content.xml' in names:
+                    xml_data = zf.read('content.xml')
+                    text = self._strip_xml_tags(xml_data.decode('utf-8', errors='ignore'))
+                    lines.extend(line.strip() for line in text.splitlines() if line.strip())
+                
+                # --- XLSX: Microsoft Excel ---
+                elif 'xl/sharedStrings.xml' in names:
+                    xml_data = zf.read('xl/sharedStrings.xml')
+                    text = self._strip_xml_tags(xml_data.decode('utf-8', errors='ignore'))
+                    lines.extend(line.strip() for line in text.splitlines() if line.strip())
+                
+                # --- Generic ZIP: try to find any readable text files inside ---
+                else:
+                    for name in names:
+                        if name.endswith(('.txt', '.csv', '.xml', '.html', '.json')):
+                            try:
+                                data = zf.read(name).decode('utf-8', errors='ignore')
+                                lines.extend(
+                                    line.strip() for line in data.splitlines() if line.strip()
+                                )
+                            except Exception:
+                                pass
+                                
+        except zipfile.BadZipFile:
+            # Not actually a ZIP — try as plain text
+            return self._extract_plaintext(filepath)
+        except Exception as e:
+            self.logger.debug(f"Could not extract office text from {filepath}: {e}")
+        return lines
+    
+    def _extract_plaintext(self, filepath: str) -> List[str]:
+        """Read a file as plain UTF-8 text, returning lines. Skips binary files."""
+        lines = []
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    lines.append(line)
+        except UnicodeDecodeError:
+            # Binary file — can't read as text
+            pass
+        except PermissionError:
+            self.logger.warning(f"Permission denied reading: {filepath}")
+        except Exception as e:
+            self.logger.debug(f"Could not read file {filepath}: {e}")
+        return lines
+    
+    def _strip_xml_tags(self, xml_text: str) -> str:
+        """Remove all XML/HTML tags from a string, leaving only the text content."""
+        # Use regex to strip tags — faster than full XML parsing for search
+        clean = re.sub(r'<[^>]+>', ' ', xml_text)
+        # Collapse whitespace
+        clean = re.sub(r'\s+', ' ', clean)
+        return clean
+    
+    def keyword_search(self, session_id: str, keywords: List[str],
+                       case_sensitive: bool = False,
+                       search_content: bool = True,
+                       max_snippet_length: int = 120) -> List[Dict[str, Any]]:
+        """
+        Search for keywords in recovered file names AND file contents.
+        
+        This is the core forensic keyword search capability. It performs:
+        1. Filename matching — checks if any keyword appears in the file's name
+        2. Content matching — reads each file as text and searches line-by-line,
+           recording the line number and a context snippet for each hit
+        
+        Binary files (those that fail UTF-8 decoding) are skipped for content
+        search but still checked for filename matches.
+        
+        Args:
+            session_id: Active session identifier
+            keywords: List of keyword strings to search for
+            case_sensitive: If False (default), search is case-insensitive
+            search_content: If True (default), search inside file contents too
+            max_snippet_length: Max characters to include in content snippets
+            
+        Returns:
+            List of match result dicts, each containing:
+              - name: filename
+              - path: full file path
+              - size: file size in bytes
+              - type: file extension/type
+              - match_type: 'filename', 'content', or 'both'
+              - matched_keywords: list of keywords that matched
+              - content_matches: list of {line_number, line_text, keyword} dicts
+              
+        Raises:
+            KeyError: If session not found
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            raise KeyError(f"Session not found: {session_id}")
+        
+        self.logger.info(f"Keyword search: {keywords} (case_sensitive={case_sensitive}, content={search_content})")
+        
+        # Combine all recovered + carved files into one list to search through
+        all_files = session.recovered_files + session.carved_files
+        
+        # Normalize keywords for case-insensitive comparison if needed
+        if not case_sensitive:
+            search_keywords = [kw.lower() for kw in keywords]
+        else:
+            search_keywords = list(keywords)
+        
+        results = []
+        
+        for file_info in all_files:
+            filename = file_info.get('name', '')
+            filepath = file_info.get('path', '')
+            
+            # --- Step 1: Check filename for keyword matches ---
+            # Compare against the filename (not the full path) to avoid
+            # false positives from directory names
+            compare_name = filename if case_sensitive else filename.lower()
+            filename_matched_keywords = [
+                kw for kw in search_keywords if kw in compare_name
+            ]
+            
+            # --- Step 2: Check file content for keyword matches ---
+            # Only attempt content search if:
+            #   a) search_content is enabled
+            #   b) the file path exists on disk (it may have been recovered)
+            content_matches = []
+            content_matched_keywords = set()
+            
+            if search_content and filepath and os.path.isfile(filepath):
+                # Extract text lines from the file based on its format.
+                # Different file types need different extraction methods:
+                #   - PDF: extract text per page using PyPDF2
+                #   - DOCX/ODT/XLSX: unzip and parse XML content
+                #   - Plain text: read as UTF-8 line by line
+                text_lines = self._extract_text_lines(filepath, file_info.get('type', ''))
+                
+                # Search through extracted text lines for keyword matches
+                for line_number, line in enumerate(text_lines, start=1):
+                    compare_line = line if case_sensitive else line.lower()
+                    
+                    for kw in search_keywords:
+                        if kw in compare_line:
+                            # Found a keyword — record the match with context
+                            snippet = line.strip()
+                            if len(snippet) > max_snippet_length:
+                                snippet = snippet[:max_snippet_length] + '...'
+                            
+                            content_matches.append({
+                                'line_number': line_number,
+                                'line_text': snippet,
+                                'keyword': kw
+                            })
+                            content_matched_keywords.add(kw)
+            
+            # --- Step 3: Build result if any match was found ---
+            all_matched = set(filename_matched_keywords) | content_matched_keywords
+            
+            if all_matched:
+                # Determine the match type so the UI can show appropriate icons
+                has_filename = len(filename_matched_keywords) > 0
+                has_content = len(content_matched_keywords) > 0
+                
+                if has_filename and has_content:
+                    match_type = 'both'
+                elif has_filename:
+                    match_type = 'filename'
+                else:
+                    match_type = 'content'
+                
+                results.append({
+                    'name': filename,
+                    'path': filepath,
+                    'size': file_info.get('size', 0),
+                    'type': file_info.get('type', 'unknown'),
+                    'match_type': match_type,
+                    'matched_keywords': list(all_matched),
+                    'content_matches': content_matches,
+                })
+        
+        self.logger.info(f"Keyword search complete: {len(results)} files matched out of {len(all_files)} total")
+        return results
     
     def generate_report(self, session_id: str, format: str = "pdf") -> Path:
         """

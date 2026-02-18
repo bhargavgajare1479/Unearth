@@ -88,11 +88,15 @@ class ScanWorker(QThread):
     scan_completed = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
     
-    def __init__(self, app, session_id, file_filter="all"):
+    def __init__(self, app, session_id, file_filter="all",
+                 enable_carving=True, carve_file_types=None):
         super().__init__()
         self.app = app
         self.session_id = session_id
         self.file_filter = file_filter  # "all", "deleted_only", or "active_only"
+        # Carving options: whether to carve at all, and which file types
+        self.enable_carving = enable_carving
+        self.carve_file_types = carve_file_types  # None = all types, or list like ['jpg','pdf']
         
     def run(self):
         try:
@@ -112,8 +116,16 @@ class ScanWorker(QThread):
                 file_filter=self.file_filter
             )
             
-            self.progress_updated.emit(90, "Carving files...")
-            carved = self.app.carve_files(self.session_id)
+            # --- File carving (optional) ---
+            # Only carve if the user enabled it in the scan options dialog.
+            # When enabled, pass the selected file types to restrict which
+            # signatures are scanned for (e.g., only 'jpg' and 'png').
+            carved = []
+            if self.enable_carving:
+                self.progress_updated.emit(90, "Carving files...")
+                carved = self.app.carve_files(self.session_id, file_types=self.carve_file_types)
+            else:
+                self.progress_updated.emit(90, "Skipping file carving (disabled)")
             
             self.progress_updated.emit(100, "Complete")
             self.scan_completed.emit({
@@ -523,7 +535,12 @@ class UnearthGUI(QMainWindow):
             
             if self.app and BACKEND_AVAILABLE:
                 self.current_session = self.app.create_session(source_path, str(output_dir))
-                self.start_scan()
+                
+                # Show carving options dialog before starting the scan
+                # This lets users choose whether to enable carving and which
+                # file types to look for, avoiding the 300k MP4 problem
+                enable_carving, carve_types = self._show_carving_options()
+                self.start_scan(enable_carving=enable_carving, carve_file_types=carve_types)
             else:
                 # Demo mode
                 self.generate_demo_data()
@@ -544,12 +561,209 @@ class UnearthGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start session:\n{str(e)}")
     
-    def start_scan(self):
-        """Start background scan"""
+    def _show_carving_options(self):
+        """
+        Show a dialog letting the user configure file carving before scanning.
+        
+        Options:
+        - Enable/disable carving entirely (checkbox at the top)
+        - Select which file types to carve for (individual checkboxes)
+        
+        Returns:
+            Tuple of (enable_carving: bool, file_types: list or None)
+            - If carving is disabled, returns (False, None)
+            - If all types selected, returns (True, None) meaning "carve everything"
+            - If specific types selected, returns (True, ['jpg', 'png', ...]) 
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Carving Options")
+        dialog.setStyleSheet("background-color: #16161E; color: #FFFFFF;")
+        dialog.setMinimumWidth(450)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+        
+        # Title
+        title = QLabel("File Carving Settings")
+        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title.setStyleSheet("color: #FFFFFF; padding: 5px;")
+        layout.addWidget(title)
+        
+        # Description
+        desc = QLabel(
+            "File carving scans raw disk data for file signatures.\n"
+            "This can be slow on large partitions. You can disable it\n"
+            "or select only the file types you need."
+        )
+        desc.setStyleSheet("color: #9CA3AF; font-size: 13px; padding: 0 5px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+        
+        # -- Shared checkbox style --
+        # Explicit indicator styling so checkboxes are clearly visible on dark backgrounds.
+        # Checked = green indicator, unchecked = dark border, disabled = dimmed out.
+        checkbox_style = """
+            QCheckBox {
+                spacing: 8px;
+                color: #D1D5DB;
+                font-size: 12px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 2px solid #4B5563;
+                background-color: #1E1E2E;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #10B981;
+                border-color: #10B981;
+            }
+            QCheckBox::indicator:disabled {
+                background-color: #2A2F3A;
+                border-color: #333844;
+            }
+            QCheckBox:disabled {
+                color: #4B5563;
+            }
+        """
+        
+        # Master toggle: enable/disable carving
+        enable_cb = QCheckBox("Enable file carving")
+        enable_cb.setChecked(True)
+        enable_cb.setStyleSheet(checkbox_style + """
+            QCheckBox { font-size: 14px; font-weight: bold; color: #FFFFFF; padding: 5px; }
+            QCheckBox::indicator:checked { background-color: #3B82F6; border-color: #3B82F6; }
+        """)
+        layout.addWidget(enable_cb)
+        
+        # --- File type selection area ---
+        # Group the supported types into categories for cleaner UI
+        type_categories = {
+            "Images": ['jpg', 'png', 'gif', 'bmp', 'tiff', 'webp', 'heic'],
+            "Documents": ['pdf', 'zip'],  # zip covers docx/xlsx/pptx
+            "Audio": ['mp3', 'mp3_id3'],
+            "Video": ['mp4', 'avi'],
+            "Archives": ['7z', 'rar'],
+        }
+        
+        # Container for type checkboxes (disabled when carving is off)
+        types_container = QWidget()
+        types_layout = QVBoxLayout(types_container)
+        types_layout.setContentsMargins(20, 0, 0, 0)
+        
+        # "Select All" checkbox for convenience
+        select_all_cb = QCheckBox("Select All")
+        select_all_cb.setChecked(True)
+        select_all_cb.setStyleSheet(checkbox_style + """
+            QCheckBox { font-size: 13px; font-weight: bold; color: #3B82F6; }
+        """)
+        types_layout.addWidget(select_all_cb)
+        
+        # Create checkboxes for each category and file type
+        type_checkboxes = {}  # Maps type_key -> QCheckBox
+        for category, types in type_categories.items():
+            cat_label = QLabel(f"  {category}:")
+            cat_label.setStyleSheet("color: #9CA3AF; font-size: 12px; margin-top: 4px;")
+            types_layout.addWidget(cat_label)
+            
+            row = QHBoxLayout()
+            for t in types:
+                # Clean up display name (remove underscores, show friendly label)
+                display = t.upper().replace('_', ' ')
+                if t == 'zip':
+                    display = 'ZIP/DOCX/XLSX'  # Clarify that ZIP covers Office formats
+                elif t == 'mp3_id3':
+                    display = 'MP3 (ID3)'
+                cb = QCheckBox(display)
+                cb.setChecked(True)
+                cb.setStyleSheet(checkbox_style)
+                cb.setProperty('file_type', t)  # Store the actual type key
+                type_checkboxes[t] = cb
+                row.addWidget(cb)
+            row.addStretch()
+            types_layout.addLayout(row)
+        
+        layout.addWidget(types_container)
+        
+        # --- Wiring: enable/disable carving toggles the type selection ---
+        # When carving is disabled, uncheck all types and grey them out.
+        # When re-enabled, re-check all types so the user starts fresh.
+        def toggle_types(checked):
+            types_container.setEnabled(checked)
+            # Auto-check/uncheck all type boxes to match the master toggle
+            select_all_cb.setChecked(checked)
+            for cb in type_checkboxes.values():
+                cb.setChecked(checked)
+        enable_cb.toggled.connect(toggle_types)
+        
+        # --- Wiring: "Select All" toggles all type checkboxes ---
+        def toggle_all(checked):
+            for cb in type_checkboxes.values():
+                cb.setChecked(checked)
+        select_all_cb.toggled.connect(toggle_all)
+        
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        start_btn = QPushButton("Start Scan")
+        start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #10B981;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 24px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+        """)
+        start_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(start_btn)
+        layout.addLayout(btn_layout)
+        
+        # Show dialog (always proceeds — scan starts regardless)
+        dialog.exec()
+        
+        # --- Read the user's choices ---
+        carving_enabled = enable_cb.isChecked()
+        
+        if not carving_enabled:
+            return (False, None)
+        
+        # Collect selected file types
+        selected_types = [
+            cb.property('file_type')
+            for cb in type_checkboxes.values()
+            if cb.isChecked()
+        ]
+        
+        # If all types are selected, pass None (meaning "carve everything")
+        # to avoid an unnecessarily long filter list
+        if len(selected_types) == len(type_checkboxes):
+            return (True, None)
+        
+        # If nothing selected but carving enabled, treat as disabled
+        if not selected_types:
+            return (False, None)
+        
+        return (True, selected_types)
+    
+    def start_scan(self, enable_carving=True, carve_file_types=None):
+        """Start background scan with optional carving configuration"""
         if not self.app or not self.current_session:
             return
         
-        self.scan_worker = ScanWorker(self.app, self.current_session, self.file_filter)
+        # Pass carving options to the worker thread
+        self.scan_worker = ScanWorker(
+            self.app, self.current_session, self.file_filter,
+            enable_carving=enable_carving,
+            carve_file_types=carve_file_types
+        )
         self.scan_worker.progress_updated.connect(self.update_progress)
         self.scan_worker.scan_completed.connect(self.scan_complete)
         self.scan_worker.error_occurred.connect(self.scan_error)
@@ -1424,7 +1638,7 @@ class UnearthGUI(QMainWindow):
         title.setStyleSheet("color: #FFFFFF;")
         layout.addWidget(title)
         
-        # Search input
+        # Search input row: text field + search button
         search_layout = QHBoxLayout()
         self.keyword_input = QLineEdit()
         self.keyword_input.setPlaceholderText("Enter keywords (comma-separated)")
@@ -1458,7 +1672,18 @@ class UnearthGUI(QMainWindow):
         search_layout.addWidget(search_btn)
         layout.addLayout(search_layout)
         
-        # Results
+        # Options row: checkbox to toggle content search on/off
+        # This lets users choose between a fast filename-only search
+        # and a deeper (but slower) content-based search
+        options_layout = QHBoxLayout()
+        self.search_content_checkbox = QCheckBox("Search file contents (not just filenames)")
+        self.search_content_checkbox.setChecked(True)  # Content search enabled by default
+        self.search_content_checkbox.setStyleSheet("color: #9CA3AF; font-size: 13px;")
+        options_layout.addWidget(self.search_content_checkbox)
+        options_layout.addStretch()
+        layout.addLayout(options_layout)
+        
+        # Results area: displays search matches as styled HTML
         self.search_results = QTextEdit()
         self.search_results.setReadOnly(True)
         self.search_results.setStyleSheet("""
@@ -1470,37 +1695,181 @@ class UnearthGUI(QMainWindow):
                 padding: 15px;
             }
         """)
-        self.search_results.setHtml("<p style='color: #9CA3AF;'>Enter keywords and click Search...</p>")
+        self.search_results.setHtml("<p style='color: #9CA3AF;'>Enter keywords and click Search...<br/><br/>"
+                                    "<b>Tip:</b> Enable 'Search file contents' to find keywords "
+                                    "inside recovered text files (e.g., 'password', 'confidential').</p>")
         layout.addWidget(self.search_results)
         
         return view
     
     def perform_keyword_search(self):
-        """Perform keyword search"""
+        """
+        Perform keyword search across recovered files.
+        
+        Uses the centralized app.keyword_search() method which searches both
+        filenames and file contents. Falls back to a local filename-only search
+        if the backend or session is not available (e.g., demo mode).
+        """
         keywords = self.keyword_input.text().strip()
         if not keywords:
             return
         
-        keyword_list = [k.strip().lower() for k in keywords.split(',')]
+        # Split comma-separated keywords and clean whitespace
+        keyword_list = [k.strip() for k in keywords.split(',') if k.strip()]
+        
+        # Check whether the user wants content search (from the checkbox)
+        search_content = self.search_content_checkbox.isChecked()
+        
+        # --- Try using the backend's keyword_search method ---
+        # This gives us filename + content matching with line numbers
+        if self.app and self.current_session and BACKEND_AVAILABLE:
+            try:
+                results = self.app.keyword_search(
+                    self.current_session,
+                    keyword_list,
+                    case_sensitive=False,
+                    search_content=search_content
+                )
+                self._display_search_results(keywords, results, search_content)
+                return
+            except Exception as e:
+                # If backend search fails, fall through to local fallback
+                self.search_results.setHtml(
+                    f"<p style='color: #EF4444;'>Search error: {str(e)}</p>"
+                )
+                return
+        
+        # --- Fallback: local filename-only search (no session / demo mode) ---
+        # This preserves the original behaviour for when no backend is connected
         all_files = self.recovered_files + self.carved_files
-        
-        html = f"<h3 style='color: #3B82F6;'>Search Results: {keywords}</h3>"
-        html += f"<p style='color: #9CA3AF;'>Searching {len(all_files)} files...</p><br/>"
-        
-        matches = 0
+        fallback_results = []
         for f in all_files:
             filename = f.get('name', '').lower()
-            if any(kw in filename for kw in keyword_list):
-                matches += 1
-                html += f"""
-                <div style='margin: 8px 0; padding: 8px; background-color: #2A2F3A; border-radius: 6px;'>
-                    <span style='color: #10B981; font-weight: bold;'>✓ Match</span><br/>
-                    <span style='color: #FFFFFF;'>{f.get('name', 'Unknown')}</span><br/>
-                    <span style='color: #9CA3AF;'>Type: {f.get('type', 'Unknown')} | Size: {format_bytes(f.get('size', 0))}</span>
-                </div>
-                """
+            matched = [kw for kw in keyword_list if kw.lower() in filename]
+            if matched:
+                fallback_results.append({
+                    'name': f.get('name', 'Unknown'),
+                    'path': f.get('path', ''),
+                    'size': f.get('size', 0),
+                    'type': f.get('type', 'unknown'),
+                    'match_type': 'filename',
+                    'matched_keywords': matched,
+                    'content_matches': [],
+                })
+        self._display_search_results(keywords, fallback_results, search_content=False)
+    
+    def _display_search_results(self, query: str, results: list, search_content: bool):
+        """
+        Render keyword search results as styled HTML in the search_results widget.
         
-        html += f"<br/><p style='color: #FFFFFF;'><strong>Total Matches: {matches}</strong></p>"
+        Each result card shows:
+        - The filename, file type, and size
+        - The match type icon (📄 filename, 📝 content, or 📄📝 both)
+        - Which keywords matched
+        - For content matches: the line number and a snippet of the matching line
+        
+        Args:
+            query: The original search query string (for display)
+            results: List of match dicts from app.keyword_search()
+            search_content: Whether content search was enabled (for the summary)
+        """
+        # -- Header section --
+        mode_label = "filenames + contents" if search_content else "filenames only"
+        html = f"<h3 style='color: #3B82F6;'>Search Results: {query}</h3>"
+        html += f"<p style='color: #9CA3AF;'>Mode: {mode_label} | "
+        html += f"Found <b>{len(results)}</b> matching file(s)</p><br/>"
+        
+        if not results:
+            html += "<p style='color: #9CA3AF;'>No matches found. Try different keywords.</p>"
+            self.search_results.setHtml(html)
+            return
+        
+        # -- Render each matched file as a styled card --
+        for result in results:
+            # Choose an icon based on match type to make it visually scannable
+            match_type = result.get('match_type', 'filename')
+            if match_type == 'both':
+                type_icon = "📄📝"  # Matched in both filename and content
+                type_label = "Filename + Content"
+                type_color = "#A78BFA"  # Purple for dual match
+            elif match_type == 'content':
+                type_icon = "📝"  # Matched only in content
+                type_label = "Content Match"
+                type_color = "#F59E0B"  # Amber for content
+            else:
+                type_icon = "📄"  # Matched only in filename
+                type_label = "Filename Match"
+                type_color = "#10B981"  # Green for filename
+            
+            # File size formatted for display
+            size = result.get('size', 0)
+            size_str = format_bytes(size)
+            
+            # List of matched keywords as styled tags
+            matched_kws = ', '.join(result.get('matched_keywords', []))
+            
+            # Build the card HTML
+            html += f"""
+            <div style='margin: 10px 0; padding: 12px; background-color: #2A2F3A; 
+                        border-radius: 8px; border-left: 4px solid {type_color};'>
+                <div style='margin-bottom: 6px;'>
+                    <span style='font-size: 14px;'>{type_icon}</span>
+                    <span style='color: #FFFFFF; font-weight: bold; font-size: 14px;'>
+                        {result.get('name', 'Unknown')}
+                    </span>
+                    <span style='color: {type_color}; font-size: 12px; margin-left: 8px;'>
+                        [{type_label}]
+                    </span>
+                </div>
+                <div style='color: #9CA3AF; font-size: 12px; margin-bottom: 4px;'>
+                    Type: {result.get('type', 'unknown').upper()} | Size: {size_str} | 
+                    Keywords: <span style='color: #F59E0B;'>{matched_kws}</span>
+                </div>
+            """
+            
+            # -- Content match snippets --
+            # Show up to 5 content matches per file to avoid overwhelming output.
+            # Each snippet shows line number and the matching line text.
+            content_matches = result.get('content_matches', [])
+            if content_matches:
+                # Cap displayed snippets at 5 per file
+                display_matches = content_matches[:5]
+                remaining = len(content_matches) - 5
+                
+                html += "<div style='margin-top: 8px; padding: 8px; background-color: #1E1E2E; border-radius: 6px;'>"
+                html += "<div style='color: #9CA3AF; font-size: 11px; margin-bottom: 4px;'>Content matches:</div>"
+                
+                for cm in display_matches:
+                    line_num = cm.get('line_number', '?')
+                    line_text = cm.get('line_text', '')
+                    # Escape HTML special characters in the snippet to
+                    # prevent broken rendering from file content
+                    line_text = (line_text.replace('&', '&amp;')
+                                         .replace('<', '&lt;')
+                                         .replace('>', '&gt;'))
+                    html += f"""
+                    <div style='margin: 3px 0; font-family: monospace; font-size: 12px;'>
+                        <span style='color: #6B7280;'>Line {line_num}:</span>
+                        <span style='color: #D1D5DB;'>{line_text}</span>
+                    </div>
+                    """
+                
+                # If there were more matches, indicate how many were omitted
+                if remaining > 0:
+                    html += f"<div style='color: #6B7280; font-size: 11px; margin-top: 4px;'>... and {remaining} more match(es)</div>"
+                
+                html += "</div>"
+            
+            html += "</div>"  # Close the card div
+        
+        # -- Footer summary --
+        total_content_hits = sum(len(r.get('content_matches', [])) for r in results)
+        html += f"<br/><p style='color: #FFFFFF;'>"
+        html += f"<strong>Summary:</strong> {len(results)} file(s) matched"
+        if total_content_hits > 0:
+            html += f" with {total_content_hits} content hit(s)"
+        html += "</p>"
+        
         self.search_results.setHtml(html)
     
     def create_integrity_view(self):

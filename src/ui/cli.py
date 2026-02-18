@@ -425,42 +425,98 @@ def timeline(session_id):
 @click.argument('session_id')
 @click.argument('keywords')
 @click.option('--case-sensitive', is_flag=True, help='Enable case-sensitive search')
-def search(session_id, keywords, case_sensitive):
-    """Search for keywords in recovered files"""
+@click.option('--no-content', is_flag=True, help='Search filenames only (skip content search)')
+def search(session_id, keywords, case_sensitive, no_content):
+    """Search for keywords in recovered files (filenames + content)"""
     console.print(f"\n[bold cyan]Keyword Search[/bold cyan]\n")
     
     if not BACKEND_AVAILABLE:
         console.print("[red]Error: Backend not available[/red]")
         return
     
-    keyword_list = [k.strip() for k in keywords.split(',')]
+    # Parse comma-separated keywords into a list
+    keyword_list = [k.strip() for k in keywords.split(',') if k.strip()]
+    
+    # Whether to search inside file contents (default: yes, unless --no-content)
+    search_content = not no_content
     
     console.print(f"[bold]Searching for:[/bold] {', '.join(keyword_list)}")
-    console.print(f"[bold]Case sensitive:[/bold] {'Yes' if case_sensitive else 'No'}\n")
+    console.print(f"[bold]Case sensitive:[/bold] {'Yes' if case_sensitive else 'No'}")
+    console.print(f"[bold]Content search:[/bold] {'Enabled' if search_content else 'Disabled (filenames only)'}\n")
     
     try:
+        app = UnearthApp()
+        
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
             task = progress.add_task("[cyan]Searching files...", total=None)
             
-            # Mock search (in real implementation, search recovered files)
-            import time
-            time.sleep(1)
+            # Call the centralized keyword_search method in UnearthApp
+            # This searches both filenames and file contents (if enabled)
+            search_results = app.keyword_search(
+                session_id,
+                keyword_list,
+                case_sensitive=case_sensitive,
+                search_content=search_content
+            )
             
             progress.update(task, completed=True)
         
-        # Display results
-        results = Table(title=f"Search Results ({len(keyword_list)} keywords)", box=box.ROUNDED)
-        results.add_column("File", style="cyan")
-        results.add_column("Matches", style="yellow")
-        results.add_column("Type", style="white")
+        # --- Display results in a Rich table ---
+        if not search_results:
+            console.print("[yellow]No matches found.[/yellow]\n")
+            return
         
-        results.add_row("document_001.txt", "password", "text")
-        results.add_row("report_final.pdf", "confidential", "pdf")
-        results.add_row("notes.docx", "password, confidential", "docx")
+        results_table = Table(
+            title=f"Search Results \u2014 {len(search_results)} file(s) matched",
+            box=box.ROUNDED
+        )
+        results_table.add_column("File", style="cyan", max_width=40)
+        results_table.add_column("Match Type", style="white")
+        results_table.add_column("Keywords", style="yellow")
+        results_table.add_column("Content Snippet", style="dim", max_width=60)
         
-        console.print(results)
-        console.print("\n[dim]Showing sample results. Full search in complete implementation.[/dim]\n")
+        for result in search_results:
+            # Format match type with colour coding
+            match_type = result.get('match_type', 'filename')
+            if match_type == 'both':
+                type_str = "[magenta]Filename + Content[/magenta]"
+            elif match_type == 'content':
+                type_str = "[yellow]Content[/yellow]"
+            else:
+                type_str = "[green]Filename[/green]"
+            
+            # Join matched keywords
+            kws = ', '.join(result.get('matched_keywords', []))
+            
+            # Build a brief content snippet from the first content match (if any)
+            # Shows the line number and a truncated preview of the matching line
+            content_matches = result.get('content_matches', [])
+            if content_matches:
+                first = content_matches[0]
+                snippet = f"Line {first['line_number']}: {first['line_text'][:50]}"
+                if len(content_matches) > 1:
+                    snippet += f" (+{len(content_matches) - 1} more)"
+            else:
+                snippet = "-"
+            
+            results_table.add_row(
+                result.get('name', 'Unknown'),
+                type_str,
+                kws,
+                snippet
+            )
         
+        console.print(results_table)
+        
+        # --- Summary ---
+        total_content_hits = sum(len(r.get('content_matches', [])) for r in search_results)
+        console.print(f"\n[bold]Total:[/bold] {len(search_results)} file(s) matched", end="")
+        if total_content_hits > 0:
+            console.print(f" with {total_content_hits} content hit(s)", end="")
+        console.print("\n")
+        
+    except KeyError:
+        console.print(f"[bold red]Error:[/bold red] Session '{session_id}' not found")
     except Exception as e:
         console.print(f"[bold red]Error:[/bold red] {str(e)}")
 
