@@ -103,12 +103,12 @@ class ScanWorker(QThread):
             self.progress_updated.emit(10, "Detecting filesystem...")
             fs_type = self.app.detect_filesystem(self.session_id)
             
-            self.progress_updated.emit(20, f"Scanning filesystem (filter: {self.file_filter})...")
+            self.progress_updated.emit(20, "Scanning filesystem...")
             
             def scan_progress(percent, msg):
-                # Map 0-100 scan progress to 20-90 overall progress
-                overall = 20 + int(percent * 0.7)
-                self.progress_updated.emit(overall, f"Scanning: {msg}")
+                # Map 0-100 scan progress to 20-85 overall progress
+                overall = 20 + int(percent * 0.65)
+                self.progress_updated.emit(overall, msg)
                 
             recovered = self.app.recover_deleted_files(
                 self.session_id, 
@@ -117,17 +117,14 @@ class ScanWorker(QThread):
             )
             
             # --- File carving (optional) ---
-            # Only carve if the user enabled it in the scan options dialog.
-            # When enabled, pass the selected file types to restrict which
-            # signatures are scanned for (e.g., only 'jpg' and 'png').
             carved = []
             if self.enable_carving:
-                self.progress_updated.emit(90, "Carving files...")
+                self.progress_updated.emit(88, "Carving files...")
                 carved = self.app.carve_files(self.session_id, file_types=self.carve_file_types)
             else:
-                self.progress_updated.emit(90, "Skipping file carving (disabled)")
+                self.progress_updated.emit(90, "Skipping file carving")
             
-            self.progress_updated.emit(100, "Complete")
+            self.progress_updated.emit(100, "Scan complete!")
             self.scan_completed.emit({
                 'recovered': recovered,
                 'carved': carved
@@ -942,6 +939,7 @@ class UnearthGUI(QMainWindow):
             }
         """)
         self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")  # Show only the percentage on the bar
         progress_layout.addWidget(self.progress_bar)
         
         self.progress_container.setVisible(False)
