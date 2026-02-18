@@ -15,6 +15,7 @@ Dependencies:
 
 import click
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
@@ -390,7 +391,7 @@ def carve(image_path, output_dir, types, threads):
 @cli.command()
 @click.argument('session_id')
 def timeline(session_id):
-    """Generate file timeline visualization"""
+    """Generate file timeline visualization from recovered files"""
     console.print(f"\n[bold cyan]File Timeline Analysis[/bold cyan]\n")
     
     if not BACKEND_AVAILABLE:
@@ -399,23 +400,96 @@ def timeline(session_id):
     
     try:
         app = UnearthApp()
-        session_info = app.get_session_info(session_id)
+        session = app.sessions.get(session_id)
+        if not session:
+            console.print(f"[red]Error: Session '{session_id}' not found[/red]")
+            return
         
-        # Mock timeline data (in real implementation, get from recovered files)
-        console.print("[bold]Interactive File Timeline[/bold]\n")
-        console.print("[dim]Showing file activity based on timestamps...[/dim]\n")
+        # Gather all files (recovered + carved)
+        all_files = session.recovered_files + session.carved_files
         
-        timeline_tree = Tree("📅 [bold]Timeline Events[/bold]")
+        if not all_files:
+            console.print("[yellow]No files found in this session. Run a scan first.[/yellow]")
+            return
         
-        # Add sample events
-        timeline_tree.add("🕐 2025-01-15 10:23:45 - [cyan]document.pdf[/cyan] created")
-        timeline_tree.add("🕐 2025-01-15 14:30:12 - [cyan]image.jpg[/cyan] modified")
-        timeline_tree.add("🕐 2025-01-16 09:15:33 - [cyan]report.docx[/cyan] accessed")
-        timeline_tree.add("🕐 2025-01-16 16:45:21 - [red]sensitive.txt[/red] deleted")
+        # Build timeline events from actual file metadata
+        events = []
+        for f in all_files:
+            name = f.get('name', 'unknown')
+            status = f.get('status', 'unknown')
+            modified = f.get('modified', '')
+            ftype = f.get('type', '?')
+            size = f.get('size', 0)
+            
+            # Use the file's modification timestamp if available
+            if modified:
+                events.append({
+                    'timestamp': modified,
+                    'name': name,
+                    'status': status,
+                    'type': ftype,
+                    'size': size,
+                })
+            else:
+                # For carved files without timestamps, try to read from disk
+                filepath = f.get('path', '')
+                if filepath and os.path.isfile(filepath):
+                    import os as _os
+                    mtime = datetime.fromtimestamp(_os.path.getmtime(filepath))
+                    events.append({
+                        'timestamp': mtime.strftime('%Y-%m-%d %H:%M:%S'),
+                        'name': name,
+                        'status': status,
+                        'type': ftype,
+                        'size': size,
+                    })
         
-        console.print(timeline_tree)
+        if not events:
+            console.print("[yellow]No timestamp data available for recovered files.[/yellow]")
+            return
         
-        console.print(f"\n[dim]Full timeline available in forensic report[/dim]\n")
+        # Sort by timestamp
+        events.sort(key=lambda e: e['timestamp'])
+        
+        # Display as a table
+        table = Table(title=f"Timeline ({len(events)} events)", box=box.ROUNDED)
+        table.add_column("Timestamp", style="cyan", no_wrap=True)
+        table.add_column("File", style="white")
+        table.add_column("Type", style="dim", justify="center")
+        table.add_column("Status", justify="center")
+        table.add_column("Size", style="dim", justify="right")
+        
+        for event in events:
+            # Color-code status
+            status = event['status']
+            if status == 'deleted':
+                status_str = "[red]🗑️ Deleted[/red]"
+            elif status == 'carved':
+                status_str = "[yellow]🔍 Carved[/yellow]"
+            elif status == 'active':
+                status_str = "[green]✅ Active[/green]"
+            else:
+                status_str = f"[dim]{status}[/dim]"
+            
+            # Format size
+            size = event['size']
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1048576:
+                size_str = f"{size/1024:.1f} KB"
+            else:
+                size_str = f"{size/1048576:.1f} MB"
+            
+            table.add_row(
+                event['timestamp'],
+                event['name'],
+                event['type'].upper(),
+                status_str,
+                size_str,
+            )
+        
+        console.print(table)
+        console.print(f"\n[dim]Total: {len(events)} file events across the session[/dim]\n")
         
     except Exception as e:
         console.print(f"[bold red]Error:[/bold red] {str(e)}")

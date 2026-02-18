@@ -526,17 +526,118 @@ def request_root_permissions():
 
 
 # Convenience functions
+
+def _get_removable_device_names() -> set:
+    """Get the set of removable device base names (e.g. {'sdb', 'sdc'})."""
+    removable = set()
+    if sys.platform.startswith('linux'):
+        try:
+            for device in Path('/sys/block').iterdir():
+                removable_path = device / 'removable'
+                if removable_path.exists():
+                    with open(removable_path, 'r') as f:
+                        if f.read().strip() == '1':
+                            removable.add(device.name)  # e.g. 'sdb'
+        except Exception:
+            pass
+    return removable
+
+
 def list_xfs_btrfs_partitions() -> List[Dict]:
-    """List all XFS and Btrfs partitions on the system"""
+    """List XFS/Btrfs partitions on INTERNAL (non-removable) disks only."""
     detector = PartitionDetector()
     all_partitions = detector.get_all_partitions()
-    return detector.filter_xfs_btrfs_partitions(all_partitions)
+    xfs_btrfs = detector.filter_xfs_btrfs_partitions(all_partitions)
+    
+    # Exclude removable/external drives — they belong in list_external_drives()
+    removable_names = _get_removable_device_names()
+    system_only = []
+    for p in xfs_btrfs:
+        device = p.get('device', '')
+        # Check if the partition's parent disk is removable
+        # e.g. /dev/sdb1 -> parent disk is 'sdb'
+        import re
+        match = re.match(r'/dev/(\w+?)(\d+)$', device)
+        if match:
+            parent_disk = match.group(1)  # e.g. 'sdb'
+            if parent_disk in removable_names:
+                continue  # Skip — this is an external drive
+        system_only.append(p)
+    
+    return system_only
 
 
 def list_external_drives() -> List[Dict]:
-    """List all external/removable drives"""
-    detector = PartitionDetector()
-    return detector.get_external_drives()
+    """List external/removable drives with XFS or Btrfs filesystems."""
+    removable_names = _get_removable_device_names()
+    
+    if not removable_names:
+        return []
+    
+    # Use lsblk to get detailed info about all partitions on removable disks
+    external = []
+    try:
+        import json as _json
+        result = subprocess.run(
+            ['lsblk', '-J', '-o', 'NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            data = _json.loads(result.stdout)
+            
+            for device in data.get('blockdevices', []):
+                dev_name = device.get('name', '')
+                
+                # Only process removable disks and their children
+                if dev_name not in removable_names:
+                    continue
+                
+                children = device.get('children', [])
+                if not children:
+                    # Disk itself may be a partition (no children)
+                    children = [device]
+                
+                for child in children:
+                    child_name = child.get('name', '')
+                    child_type = child.get('type', '')
+                    fstype = child.get('fstype', '') or ''
+                    mountpoint = child.get('mountpoint', '') or ''
+                    label = child.get('label', '') or ''
+                    size_str = child.get('size', '0')
+                    
+                    if child_type not in ('part', 'disk'):
+                        continue
+                    
+                    # Parse size
+                    total = 0
+                    try:
+                        if 'G' in size_str:
+                            total = int(float(size_str.replace('G', '')) * 1024**3)
+                        elif 'M' in size_str:
+                            total = int(float(size_str.replace('M', '')) * 1024**2)
+                        elif 'T' in size_str:
+                            total = int(float(size_str.replace('T', '')) * 1024**4)
+                    except ValueError:
+                        pass
+                    
+                    external.append({
+                        'device': f'/dev/{child_name}',
+                        'mountpoint': mountpoint if mountpoint else '(not mounted)',
+                        'fstype': fstype,
+                        'label': label,
+                        'removable': True,
+                        'mounted': bool(mountpoint),
+                        'total': total,
+                        'used': 0,
+                        'free': total,
+                        'percent': 0,
+                    })
+    except Exception:
+        # Fallback to psutil-based detection
+        detector = PartitionDetector()
+        return detector.get_external_drives()
+    
+    return external
 
 
 def format_bytes(size: int) -> str:

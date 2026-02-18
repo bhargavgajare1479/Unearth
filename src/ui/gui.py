@@ -492,7 +492,7 @@ class UnearthGUI(QMainWindow):
                 self.start_session(p['device'], f"Partition ({p['fstype'].upper()})")
     
     def attach_external_drive(self):
-        """Attach external drive"""
+        """Attach external drive with selection dialog"""
         external = list_external_drives()
         
         if not external:
@@ -501,27 +501,95 @@ class UnearthGUI(QMainWindow):
                 "No external/removable drives detected.\n\n"
                 "Please ensure:\n"
                 "• Drive is connected\n"
-                "• Drive is recognized by system\n"
-                "• Drive uses XFS or Btrfs filesystem"
+                "• Drive is recognized by system"
             )
             return
         
-        # Filter for XFS/Btrfs
-        supported = [e for e in external if e.get('fstype', '').lower() in ['xfs', 'btrfs']]
+        # Show selection dialog (same style as partition selection)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select External Drive")
+        dialog.setMinimumSize(500, 350)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1A1B2E;
+                color: #FFFFFF;
+            }
+        """)
         
-        if not supported:
-            QMessageBox.information(
-                self, "No Supported Drives",
-                f"Found {len(external)} external drive(s), but none use XFS or Btrfs.\n\n"
-                "Supported filesystems:\n• XFS\n• Btrfs"
-            )
-            return
+        layout = QVBoxLayout(dialog)
+        label = QLabel("Select an external drive to scan:")
+        label.setStyleSheet("color: #FFFFFF; font-size: 14px; font-weight: bold;")
+        layout.addWidget(label)
         
-        # Show selection (similar to partition selection)
-        QMessageBox.information(
-            self, "External Drives",
-            f"Found {len(supported)} supported external drive(s)"
+        list_widget = QListWidget()
+        list_widget.setStyleSheet("""
+            QListWidget {
+                background-color: #2A2F3A;
+                color: #FFFFFF;
+                border: 1px solid #3A3F4A;
+                border-radius: 8px;
+                padding: 5px;
+                font-size: 13px;
+            }
+            QListWidget::item {
+                padding: 10px;
+                border-bottom: 1px solid #3A3F4A;
+                border-radius: 4px;
+                margin: 2px;
+            }
+            QListWidget::item:selected {
+                background-color: #3B82F6;
+            }
+            QListWidget::item:hover {
+                background-color: #2A2F3A;
+            }
+        """)
+        
+        for e in external:
+            is_mounted = e.get('mounted', False)
+            mount_status = "🟢 Mounted" if is_mounted else "🔴 Unmounted"
+            fstype = e.get('fstype', 'unknown').upper() or 'Unknown FS'
+            
+            item_text = f"{e['device']} - {fstype} [{mount_status}]"
+            if is_mounted and e.get('mountpoint') and e['mountpoint'] != '(not mounted)':
+                item_text += f"\n    📁 {e['mountpoint']}"
+            if e.get('label'):
+                item_text += f" ({e['label']})"
+            if e.get('total', 0) > 0:
+                item_text += f" - {format_bytes(e.get('total', 0))}"
+            
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, e)
+            list_widget.addItem(item)
+        
+        layout.addWidget(list_widget)
+        
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        buttons.setStyleSheet("""
+            QPushButton {
+                background-color: #3B82F6;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: #2563EB;
+            }
+        """)
+        layout.addWidget(buttons)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = list_widget.currentItem()
+            if selected:
+                e = selected.data(Qt.ItemDataRole.UserRole)
+                fstype = e.get('fstype', 'unknown').upper()
+                self.start_session(e['device'], f"External Drive ({fstype})")
     
     def start_session(self, source_path, source_type):
         """Start recovery session"""
@@ -539,8 +607,14 @@ class UnearthGUI(QMainWindow):
                 enable_carving, carve_types = self._show_carving_options()
                 self.start_scan(enable_carving=enable_carving, carve_file_types=carve_types)
             else:
-                # Demo mode
-                self.generate_demo_data()
+                # Backend not available — can't run without it
+                QMessageBox.critical(
+                    self, "Backend Unavailable",
+                    "The recovery backend could not be loaded.\n\n"
+                    "Please ensure all dependencies are installed:\n"
+                    "  pip install -r requirements.txt"
+                )
+                return
             
             self.switch_view(0)
             self.update_dashboard(source_path, source_type)
@@ -785,57 +859,7 @@ class UnearthGUI(QMainWindow):
         """Handle scan error"""
         QMessageBox.critical(self, "Scan Error", f"Error during scan:\n{error}")
     
-    def generate_demo_data(self):
-        """Generate demo data for testing"""
-        self.recovered_files = []
-        for i in range(500):
-            ext = random.choice(['jpg', 'pdf', 'mp4', 'mp3', 'zip', 'txt', 'docx'])
-            status = random.choice(['deleted', 'active', 'active'])  # More active than deleted
-            # Simulate realistic integrity distribution: 70% verified, 5% corrupted, 15% unverified, 10% no_checksum
-            integrity_roll = random.random()
-            if integrity_roll < 0.70:
-                integrity_status = 'verified'
-            elif integrity_roll < 0.75:
-                integrity_status = 'corrupted'
-            elif integrity_roll < 0.90:
-                integrity_status = 'unverified'
-            else:
-                integrity_status = 'no_checksum'
-                
-            self.recovered_files.append({
-                'name': f'{"DELETED_" if status == "deleted" else "ACTIVE_"}file_{i:04d}.{ext}',
-                'original_name': f'file_{i:04d}.{ext}',
-                'size': random.randint(1024, 10485760),
-                'type': ext,
-                'status': status,
-                'integrity_status': integrity_status,
-                'integrity_verified': integrity_status == 'verified',
-                'integrity_details': f'CRC32C 0x{random.randbytes(4).hex().upper()}',
-                'modified': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'hash': f'sha256:{random.randbytes(32).hex()}'
-            })
-        
-        self.carved_files = []
-        for i in range(200):
-            ext = random.choice(['jpg', 'pdf', 'docx'])
-            self.carved_files.append({
-                'name': f'carved_file_{i:04d}.{ext}',
-                'size': random.randint(1024, 5242880),
-                'type': ext,
-                'status': 'carved',
-                'integrity_status': 'no_checksum',  # Carved files don't have filesystem checksums
-                'integrity_verified': False,
-                'integrity_details': 'Carved file (no filesystem checksum)',
-                'modified': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'hash': f'sha256:{random.randbytes(32).hex()}'
-            })
-        
-        self.current_session = 'demo_session_' + datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Update dashboard with demo data
-        self.update_dashboard_stats()
-        self.refresh_recovered_files()
-    
+
     def update_dashboard(self, source_path, source_type):
         """Update dashboard with session info"""
         # This would update the dashboard view with current session info
@@ -1435,11 +1459,6 @@ class UnearthGUI(QMainWindow):
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(QColor(status_color))
             self.file_table.setItem(row, 4, status_item)
-            
-            # Path
-            path = file_info.get('path', '')
-            path_item = QTableWidgetItem(str(path))
-            self.file_table.setItem(row, 5, path_item)
         
         # Update row count label
         if hasattr(self, 'file_count_label'):
@@ -1494,8 +1513,8 @@ class UnearthGUI(QMainWindow):
         
         # Table - Updated columns for source/status display
         self.file_table = QTableWidget()
-        self.file_table.setColumnCount(6)
-        self.file_table.setHorizontalHeaderLabels(['Name', 'Size', 'Type', 'Source', 'Status', 'Path'])
+        self.file_table.setColumnCount(5)
+        self.file_table.setHorizontalHeaderLabels(['Name', 'Size', 'Type', 'Source', 'Status'])
         self.file_table.horizontalHeader().setStretchLastSection(True)
         self.file_table.setStyleSheet("""
             QTableWidget {
@@ -1529,39 +1548,43 @@ class UnearthGUI(QMainWindow):
         self.file_table.setRowCount(len(all_files))
         
         for i, f in enumerate(all_files):
-            # Status column with color coding
-            status = f.get('status', 'unknown')
-            status_item = QTableWidgetItem(status.upper())
-            if status == 'deleted':
-                status_item.setForeground(QColor('#EF4444'))  # Red for deleted
-            elif status == 'active':
-                status_item.setForeground(QColor('#22C55E'))  # Green for active
-            else:
-                status_item.setForeground(QColor('#9CA3AF'))  # Gray for unknown/carved
-            self.file_table.setItem(i, 0, status_item)
+            # Column 0: Name
+            self.file_table.setItem(i, 0, QTableWidgetItem(f.get('name', '')))
             
-            # Integrity column with verification status
+            # Column 1: Size
+            self.file_table.setItem(i, 1, QTableWidgetItem(format_bytes(f.get('size', 0))))
+            
+            # Column 2: Type
+            self.file_table.setItem(i, 2, QTableWidgetItem(f.get('type', '').upper()))
+            
+            # Column 3: Source (recovered vs carved)
+            status = f.get('status', 'unknown')
+            if status == 'carved':
+                source_text = '🔍 Carved'
+            elif status == 'deleted':
+                source_text = '🗑️ Deleted'
+            elif status == 'active':
+                source_text = '✅ Active'
+            else:
+                source_text = status.capitalize()
+            source_item = QTableWidgetItem(source_text)
+            self.file_table.setItem(i, 3, source_item)
+            
+            # Column 4: Status (integrity)
             integrity = f.get('integrity_status', 'unverified')
             if integrity == 'verified':
                 integrity_item = QTableWidgetItem('✓ VERIFIED')
-                integrity_item.setForeground(QColor('#22C55E'))  # Green
+                integrity_item.setForeground(QColor('#22C55E'))
             elif integrity == 'corrupted':
                 integrity_item = QTableWidgetItem('✗ CORRUPTED')
-                integrity_item.setForeground(QColor('#EF4444'))  # Red
+                integrity_item.setForeground(QColor('#EF4444'))
             elif integrity == 'unverified':
                 integrity_item = QTableWidgetItem('? UNVERIFIED')
-                integrity_item.setForeground(QColor('#F59E0B'))  # Yellow
-            else:  # no_checksum
+                integrity_item.setForeground(QColor('#F59E0B'))
+            else:
                 integrity_item = QTableWidgetItem('- N/A')
-                integrity_item.setForeground(QColor('#6B7280'))  # Gray
-            self.file_table.setItem(i, 1, integrity_item)
-            
-            self.file_table.setItem(i, 2, QTableWidgetItem(f.get('name', '')))
-            self.file_table.setItem(i, 3, QTableWidgetItem(format_bytes(f.get('size', 0))))
-            self.file_table.setItem(i, 4, QTableWidgetItem(f.get('type', '')))
-            self.file_table.setItem(i, 5, QTableWidgetItem(f.get('modified', '')))
-            hash_val = f.get('hash', '')
-            self.file_table.setItem(i, 6, QTableWidgetItem(hash_val[:20] + '...' if len(hash_val) > 20 else hash_val))
+                integrity_item.setForeground(QColor('#6B7280'))
+            self.file_table.setItem(i, 4, integrity_item)
     
     def filter_files(self, text):
         """Filter files table"""
