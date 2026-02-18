@@ -82,6 +82,88 @@ def get_icon(name, color='#FFFFFF'):
     return QIcon()
 
 
+class BarChartWidget(QWidget):
+    """Custom widget that draws horizontal bar charts using QPainter.
+    Guaranteed to render in any Qt environment."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items = []  # list of (label, count, color_hex)
+        self.setMinimumHeight(200)
+    
+    def set_data(self, items):
+        """Set chart data. items: list of (label, count, color_hex_string)"""
+        self._items = items
+        self.update()  # trigger repaint
+    
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QColor, QFont, QPen
+        from PyQt6.QtCore import QRectF, Qt
+        
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Background
+        painter.fillRect(self.rect(), QColor("#1E1E2E"))
+        
+        if not self._items:
+            painter.setPen(QColor("#9CA3AF"))
+            painter.setFont(QFont("Segoe UI", 13))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No Data")
+            painter.end()
+            return
+        
+        total = sum(c for _, c, _ in self._items)
+        if total == 0:
+            painter.setPen(QColor("#9CA3AF"))
+            painter.setFont(QFont("Segoe UI", 13))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No Data")
+            painter.end()
+            return
+        
+        w = self.width()
+        bar_x = 130  # left margin for labels
+        bar_max_w = w - bar_x - 100  # leave space for percentage on right
+        bar_height = 22
+        row_spacing = 14
+        row_height = bar_height + row_spacing
+        y = 15
+        
+        label_font = QFont("Segoe UI", 10)
+        pct_font = QFont("Segoe UI", 9)
+        
+        for label, count, color_hex in self._items:
+            pct = (count / total) * 100
+            bar_w = max(int((count / total) * bar_max_w), 6)
+            
+            # Label
+            painter.setPen(QColor("#E5E7EB"))
+            painter.setFont(label_font)
+            painter.drawText(5, y, bar_x - 10, bar_height,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             label)
+            
+            # Bar background track
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#2A2F3A"))
+            painter.drawRoundedRect(QRectF(bar_x, y, bar_max_w, bar_height), 4, 4)
+            
+            # Bar fill
+            painter.setBrush(QColor(color_hex))
+            painter.drawRoundedRect(QRectF(bar_x, y, bar_w, bar_height), 4, 4)
+            
+            # Percentage text
+            painter.setPen(QColor("#9CA3AF"))
+            painter.setFont(pct_font)
+            painter.drawText(int(bar_x + bar_max_w + 8), y, 90, bar_height,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             f"{count} ({pct:.1f}%)")
+            
+            y += row_height
+        
+        painter.end()
+
+
 class ScanWorker(QThread):
     """Background worker for scanning"""
     progress_updated = pyqtSignal(int, str)
@@ -852,8 +934,9 @@ class UnearthGUI(QMainWindow):
         # Update dashboard stats and charts
         self.update_dashboard_stats()
         
-        # Also refresh the recovered files table for when user switches to that view
+        # Refresh all data views
         self.refresh_recovered_files()
+        self.refresh_timeline()
     
     def scan_error(self, error):
         """Handle scan error"""
@@ -1081,7 +1164,7 @@ class UnearthGUI(QMainWindow):
         return card
     
     def _create_chart_card(self, title):
-        """Create a chart container card"""
+        """Create a chart container card with QTextEdit for HTML charts"""
         card = QFrame()
         card.setStyleSheet("""
             QFrame {
@@ -1101,11 +1184,13 @@ class UnearthGUI(QMainWindow):
         title_label.setStyleSheet("color: #FFFFFF; border: none;")
         layout.addWidget(title_label)
         
-        # Chart placeholder
-        chart_area = QWidget()
-        chart_area.setObjectName("chart_area")
-        chart_area.setMinimumHeight(250)
-        layout.addWidget(chart_area)
+        # QPainter-based chart widget
+        chart_widget = BarChartWidget()
+        chart_widget.setMinimumHeight(230)
+        layout.addWidget(chart_widget)
+        
+        # Store reference for easy access
+        card._chart_widget = chart_widget
         
         return card
     
@@ -1146,12 +1231,11 @@ class UnearthGUI(QMainWindow):
         # Update stat cards with new categorization
         self.total_card.findChild(QLabel, "value").setText(str(total_recovered))
         self.deleted_card.findChild(QLabel, "value").setText(str(likely_deleted))
-        self.active_card.findChild(QLabel, "value").setText(str(duplicates))  # Show duplicates (active files in carved)
+        self.active_card.findChild(QLabel, "value").setText(str(duplicates))
         self.carved_card.findChild(QLabel, "value").setText(str(carved_count))
         
         # Update session details with filter info
         total_size = sum(f.get('size', 0) for f in all_files)
-        filter_state = session.filter_state if session else {}
         self.session_details.setText(
             f"Session ID: {self.current_session[:16] if self.current_session else 'N/A'}...\n"
             f"Showing: {len(filtered_files)}/{len(all_files)} files\n"
@@ -1164,173 +1248,52 @@ class UnearthGUI(QMainWindow):
         self._update_type_chart()
         self._update_integrity_chart(verified_count, corrupted_count, unverified_count, no_checksum_count)
     
+
+    
     def _update_status_chart(self, deleted, active, carved):
-        """Update the file status pie chart"""
-        if not HAS_MATPLOTLIB:
-            return
-            
-        # Clear previous chart
-        chart_area = self.status_chart_container.findChild(QWidget, "chart_area")
-        if chart_area:
-            # Remove old layout
-            old_layout = chart_area.layout()
-            if old_layout:
-                while old_layout.count():
-                    item = old_layout.takeAt(0)
-                    if item.widget():
-                        item.widget().deleteLater()
-            else:
-                old_layout = QVBoxLayout(chart_area)
-            
-            # Create pie chart
-            fig = Figure(figsize=(4, 3), dpi=100, facecolor='#1E1E2E')
-            canvas = FigureCanvas(fig)
-            ax = fig.add_subplot(111)
-            
-            labels = []
-            sizes = []
-            colors = []
-            
-            if deleted > 0:
-                labels.append(f'Deleted ({deleted})')
-                sizes.append(deleted)
-                colors.append('#EF4444')
-            if active > 0:
-                labels.append(f'Active ({active})')
-                sizes.append(active)
-                colors.append('#22C55E')
-            if carved > 0:
-                labels.append(f'Carved ({carved})')
-                sizes.append(carved)
-                colors.append('#F59E0B')
-            
-            if sizes:
-                wedges, texts, autotexts = ax.pie(
-                    sizes, labels=labels, colors=colors, autopct='%1.1f%%',
-                    startangle=90, textprops={'color': 'white', 'fontsize': 9}
-                )
-                for autotext in autotexts:
-                    autotext.set_color('white')
-            else:
-                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
-                       color='#9CA3AF', fontsize=14, transform=ax.transAxes)
-            
-            ax.set_facecolor('#1E1E2E')
-            fig.tight_layout()
-            
-            old_layout.addWidget(canvas)
+        """Update the file status chart"""
+        chart = self.status_chart_container._chart_widget
+        items = []
+        if deleted > 0:
+            items.append(("Likely Deleted", deleted, "#EF4444"))
+        if active > 0:
+            items.append(("Duplicates", active, "#22C55E"))
+        if carved > 0:
+            items.append(("Carved (unique)", carved, "#F59E0B"))
+        chart.set_data(items)
     
     def _update_type_chart(self):
         """Update the file type distribution chart"""
-        if not HAS_MATPLOTLIB:
-            return
-            
-        chart_area = self.type_chart_container.findChild(QWidget, "chart_area")
-        if chart_area:
-            # Remove old layout
-            old_layout = chart_area.layout()
-            if old_layout:
-                while old_layout.count():
-                    item = old_layout.takeAt(0)
-                    if item.widget():
-                        item.widget().deleteLater()
-            else:
-                old_layout = QVBoxLayout(chart_area)
-            
-            # Count file types
-            all_files = self.recovered_files + self.carved_files
-            type_counts = Counter(f.get('type', 'unknown') for f in all_files)
-            
-            # Create pie chart
-            fig = Figure(figsize=(4, 3), dpi=100, facecolor='#1E1E2E')
-            canvas = FigureCanvas(fig)
-            ax = fig.add_subplot(111)
-            
-            if type_counts:
-                # Get top 6 types, group rest as "Other"
-                sorted_types = type_counts.most_common(6)
-                if len(type_counts) > 6:
-                    other_count = sum(count for _, count in type_counts.most_common()[6:])
-                    sorted_types.append(('Other', other_count))
-                
-                labels = [f'{t} ({c})' for t, c in sorted_types]
-                sizes = [c for _, c in sorted_types]
-                colors = ['#3B82F6', '#8B5CF6', '#EC4899', '#14B8A6', '#F59E0B', '#6366F1', '#9CA3AF']
-                
-                wedges, texts, autotexts = ax.pie(
-                    sizes, labels=labels, colors=colors[:len(sizes)], autopct='%1.1f%%',
-                    startangle=90, textprops={'color': 'white', 'fontsize': 8}
-                )
-                for autotext in autotexts:
-                    autotext.set_color('white')
-            else:
-                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
-                       color='#9CA3AF', fontsize=14, transform=ax.transAxes)
-            
-            ax.set_facecolor('#1E1E2E')
-            fig.tight_layout()
-            
-            old_layout.addWidget(canvas)
+        chart = self.type_chart_container._chart_widget
+        all_files = self.recovered_files + self.carved_files
+        type_counts = Counter(f.get('type', 'unknown') for f in all_files)
+        
+        type_colors = {
+            'jpg': '#3B82F6', 'jpeg': '#3B82F6', 'png': '#8B5CF6',
+            'pdf': '#EC4899', 'zip': '#14B8A6', 'docx': '#F59E0B',
+            'mp4': '#6366F1', 'mp3': '#A855F7', 'txt': '#06B6D4',
+        }
+        fallback_colors = ['#3B82F6', '#8B5CF6', '#EC4899', '#14B8A6', '#F59E0B', '#6366F1', '#9CA3AF']
+        
+        items = []
+        for idx, (ftype, count) in enumerate(type_counts.most_common(7)):
+            color = type_colors.get(ftype, fallback_colors[idx % len(fallback_colors)])
+            items.append((ftype.upper(), count, color))
+        chart.set_data(items)
     
     def _update_integrity_chart(self, verified, corrupted, unverified, no_checksum):
-        """Update the integrity verification pie chart"""
-        if not HAS_MATPLOTLIB:
-            return
-            
-        chart_area = self.integrity_chart_container.findChild(QWidget, "chart_area")
-        if chart_area:
-            # Remove old layout
-            old_layout = chart_area.layout()
-            if old_layout:
-                while old_layout.count():
-                    item = old_layout.takeAt(0)
-                    if item.widget():
-                        item.widget().deleteLater()
-            else:
-                old_layout = QVBoxLayout(chart_area)
-            
-            # Create pie chart
-            fig = Figure(figsize=(4, 3), dpi=100, facecolor='#1E1E2E')
-            canvas = FigureCanvas(fig)
-            ax = fig.add_subplot(111)
-            
-            # Collect non-zero counts
-            data = []
-            labels = []
-            colors = []
-            
-            if verified > 0:
-                data.append(verified)
-                labels.append(f'Verified ({verified})')
-                colors.append('#22C55E')  # Green
-            if corrupted > 0:
-                data.append(corrupted)
-                labels.append(f'Corrupted ({corrupted})')
-                colors.append('#EF4444')  # Red
-            if unverified > 0:
-                data.append(unverified)
-                labels.append(f'Unverified ({unverified})')
-                colors.append('#F59E0B')  # Yellow
-            if no_checksum > 0:
-                data.append(no_checksum)
-                labels.append(f'No Checksum ({no_checksum})')
-                colors.append('#6B7280')  # Gray
-            
-            if data:
-                wedges, texts, autotexts = ax.pie(
-                    data, labels=labels, colors=colors, autopct='%1.1f%%',
-                    startangle=90, textprops={'color': 'white', 'fontsize': 8}
-                )
-                for autotext in autotexts:
-                    autotext.set_color('white')
-            else:
-                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
-                       color='#9CA3AF', fontsize=14, transform=ax.transAxes)
-            
-            ax.set_facecolor('#1E1E2E')
-            fig.tight_layout()
-            
-            old_layout.addWidget(canvas)
+        """Update the integrity verification chart"""
+        chart = self.integrity_chart_container._chart_widget
+        items = []
+        if verified > 0:
+            items.append(("Verified", verified, "#22C55E"))
+        if corrupted > 0:
+            items.append(("Corrupted", corrupted, "#EF4444"))
+        if unverified > 0:
+            items.append(("Unverified", unverified, "#F59E0B"))
+        if no_checksum > 0:
+            items.append(("No Checksum", no_checksum, "#6B7280"))
+        chart.set_data(items)
     
     def _get_combo_style(self):
         """Return consistent combo box styling"""
@@ -1405,6 +1368,7 @@ class UnearthGUI(QMainWindow):
         # Use filtered files if available, otherwise all files
         files = session.filtered_files if session.filtered_files else session.all_files
         
+        self.file_table.blockSignals(True)
         self.file_table.setRowCount(0)
         
         for file_info in files:
@@ -1460,6 +1424,7 @@ class UnearthGUI(QMainWindow):
             status_item.setForeground(QColor(status_color))
             self.file_table.setItem(row, 4, status_item)
         
+        self.file_table.blockSignals(False)
         # Update row count label
         if hasattr(self, 'file_count_label'):
             total = len(session.all_files) if session.all_files else 0
@@ -1545,6 +1510,7 @@ class UnearthGUI(QMainWindow):
     def refresh_recovered_files(self):
         """Refresh recovered files table"""
         all_files = self.recovered_files + self.carved_files
+        self.file_table.blockSignals(True)
         self.file_table.setRowCount(len(all_files))
         
         for i, f in enumerate(all_files):
@@ -1585,6 +1551,7 @@ class UnearthGUI(QMainWindow):
                 integrity_item = QTableWidgetItem('- N/A')
                 integrity_item.setForeground(QColor('#6B7280'))
             self.file_table.setItem(i, 4, integrity_item)
+        self.file_table.blockSignals(False)
     
     def filter_files(self, text):
         """Filter files table"""
@@ -1629,20 +1596,76 @@ class UnearthGUI(QMainWindow):
         return view
     
     def refresh_timeline(self):
-        """Refresh timeline"""
+        """Refresh timeline with real recovered/carved file data"""
         all_files = self.recovered_files + self.carved_files
         
-        html = "<h3 style='color: #3B82F6;'>File Activity Timeline</h3>"
-        html += f"<p style='color: #9CA3AF;'>Showing events from {len(all_files)} files</p><br/>"
+        if not all_files:
+            self.timeline_text.setHtml(
+                "<p style='color:#9CA3AF; text-align:center; padding-top:40px; font-size:15px;'>"
+                "No file data available.<br/>Run a scan first to see the timeline.</p>"
+            )
+            return
         
-        sorted_files = sorted(all_files, key=lambda x: x.get('modified', ''), reverse=True)[:50]
+        # Sort by modified timestamp (newest first)
+        sorted_files = sorted(all_files, key=lambda x: x.get('modified', ''), reverse=True)
+        
+        # Summary stats
+        total_size = sum(f.get('size', 0) for f in all_files)
+        type_set = set(f.get('type', '?') for f in all_files)
+        
+        html = f"""
+        <h3 style='color: #3B82F6; margin-bottom: 4px;'>File Activity Timeline</h3>
+        <p style='color: #9CA3AF; margin-bottom: 12px;'>
+            {len(all_files)} files &nbsp;|&nbsp; {len(type_set)} types &nbsp;|&nbsp; {format_bytes(total_size)} total
+        </p>
+        """
         
         for f in sorted_files:
+            name = f.get('name', 'Unknown')
+            ftype = f.get('type', '?').upper()
+            size = f.get('size', 0)
+            modified = f.get('modified', 'Unknown')
+            status = f.get('status', 'unknown')
+            
+            # Status icon and color
+            if status == 'carved':
+                icon = '🔍'
+                status_label = 'Carved'
+                border_color = '#F59E0B'
+            elif status == 'deleted':
+                icon = '🗑️'
+                status_label = 'Deleted'
+                border_color = '#EF4444'
+            elif status == 'active':
+                icon = '✅'
+                status_label = 'Active'
+                border_color = '#22C55E'
+            else:
+                icon = '📄'
+                status_label = status.capitalize()
+                border_color = '#6B7280'
+            
+            # Format size
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1048576:
+                size_str = f"{size/1024:.1f} KB"
+            else:
+                size_str = f"{size/1048576:.1f} MB"
+            
             html += f"""
-            <div style='margin: 8px 0; padding: 8px; background-color: #2A2F3A; border-radius: 6px;'>
-                <span style='color: #3B82F6;'>{f.get('modified', 'Unknown')}</span> - 
-                <span style='color: #FFFFFF;'>{f.get('name', 'Unknown')}</span>
-                <span style='color: #9CA3AF;'> ({f.get('type', 'Unknown')})</span>
+            <div style='margin: 6px 0; padding: 10px 12px; background-color: #2A2F3A;
+                        border-radius: 8px; border-left: 3px solid {border_color};'>
+                <div>
+                    <span style='color: #3B82F6; font-size: 12px;'>{modified}</span>
+                    <span style='color: {border_color}; float: right; font-size: 11px;'>{icon} {status_label}</span>
+                </div>
+                <div style='margin-top: 4px;'>
+                    <span style='color: #FFFFFF; font-size: 13px;'>{name}</span>
+                    <span style='color:#6B7280; font-size:11px; margin-left:8px;
+                           background:#1E1E2E; padding:2px 6px; border-radius:4px;'>{ftype}</span>
+                    <span style='color: #9CA3AF; font-size: 12px; float: right;'>{size_str}</span>
+                </div>
             </div>
             """
         
@@ -2108,13 +2131,14 @@ class UnearthGUI(QMainWindow):
             report_format = "json"
         
         try:
-            if self.app and BACKEND_AVAILABLE:
-                report_path = self.app.generate_report(self.current_session, format=report_format)
-            else:
-                # Demo mode
-                report_path = Path("data/recovered_output") / f"forensic_report.{report_format}"
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text(f"Demo report - {datetime.now()}")
+            if not self.app or not BACKEND_AVAILABLE:
+                QMessageBox.warning(
+                    self, "Backend Unavailable",
+                    "Cannot generate report without a backend connection."
+                )
+                return
+            
+            report_path = self.app.generate_report(self.current_session, format=report_format)
             
             QMessageBox.information(
                 self, "Report Generated",

@@ -839,27 +839,277 @@ class UnearthApp:
             
         Returns:
             Path to generated report file
-            
-        Raises:
-            KeyError: If session not found
-            ValueError: If format not supported
         """
         session = self.sessions.get(session_id)
         if not session:
             raise KeyError(f"Session not found: {session_id}")
         
-        if format not in self.config.get("output_formats", ["pdf"]):
-            raise ValueError(f"Unsupported format: {format}")
-        
         self.logger.info(f"Generating {format} report for session {session_id}")
         
-        # TODO: Initialize report generator (will be implemented later)
-        # self.report_generator = ReportGenerator(session)
-        # report_path = self.report_generator.generate(format)
-        
         report_path = session.output_dir / f"report_{session_id}.{format}"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        all_files = session.recovered_files + session.carved_files
+        
+        if format == "json":
+            self._generate_json_report(session, all_files, report_path)
+        elif format == "csv":
+            self._generate_csv_report(session, all_files, report_path)
+        elif format == "pdf":
+            self._generate_pdf_report(session, all_files, report_path)
+        else:
+            raise ValueError(f"Unsupported format: {format}")
+        
         self.logger.info(f"Report generated: {report_path}")
         return report_path
+    
+    def _generate_json_report(self, session, all_files, report_path: Path):
+        """Generate JSON report with full session data"""
+        report = {
+            "report_type": "Unearth Forensic Recovery Report",
+            "generated_at": datetime.now().isoformat(),
+            "session": {
+                "id": session.session_id,
+                "image_path": str(session.image_path),
+                "created_at": session.created_at.isoformat(),
+                "filesystem": session.fs_type.value,
+            },
+            "summary": {
+                "total_files": len(all_files),
+                "recovered_count": len(session.recovered_files),
+                "carved_count": len(session.carved_files),
+                "total_size": sum(f.get('size', 0) for f in all_files),
+            },
+            "files": all_files,
+        }
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+    
+    def _generate_csv_report(self, session, all_files, report_path: Path):
+        """Generate CSV report with file inventory"""
+        import csv
+        
+        with open(report_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Header
+            writer.writerow([
+                'Name', 'Size (bytes)', 'Type', 'Status',
+                'Integrity', 'Modified', 'Hash', 'Source'
+            ])
+            
+            for file_info in all_files:
+                writer.writerow([
+                    file_info.get('name', ''),
+                    file_info.get('size', 0),
+                    file_info.get('type', ''),
+                    file_info.get('status', ''),
+                    file_info.get('integrity_status', ''),
+                    file_info.get('modified', ''),
+                    file_info.get('hash', ''),
+                    file_info.get('source', ''),
+                ])
+    
+    def _generate_pdf_report(self, session, all_files, report_path: Path):
+        """Generate PDF report using reportlab"""
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.lib.units import inch
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.graphics.shapes import Drawing, Rect, String
+            from reportlab.graphics import renderPDF
+        except ImportError:
+            # Fallback to plain text report if reportlab not installed
+            self.logger.warning("reportlab not installed — generating text report instead")
+            report_path = report_path.with_suffix('.txt')
+            self._generate_text_report(session, all_files, report_path)
+            return
+        
+        doc = SimpleDocTemplate(str(report_path), pagesize=A4,
+                                topMargin=0.5*inch, bottomMargin=0.5*inch)
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        # Title
+        title_style = ParagraphStyle('Title', parent=styles['Title'], fontSize=22,
+                                      textColor=colors.HexColor('#1E40AF'))
+        elements.append(Paragraph("UnEarth Forensic Recovery Report", title_style))
+        elements.append(Spacer(1, 12))
+        
+        # Session info
+        info_style = ParagraphStyle('Info', parent=styles['Normal'], fontSize=10,
+                                     textColor=colors.HexColor('#374151'))
+        elements.append(Paragraph(f"<b>Session ID:</b> {session.session_id}", info_style))
+        elements.append(Paragraph(f"<b>Image:</b> {session.image_path}", info_style))
+        elements.append(Paragraph(f"<b>Filesystem:</b> {session.fs_type.value}", info_style))
+        elements.append(Paragraph(f"<b>Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", info_style))
+        elements.append(Paragraph(f"<b>Total Files:</b> {len(all_files)}", info_style))
+        total_size = sum(f.get('size', 0) for f in all_files)
+        elements.append(Paragraph(f"<b>Total Size:</b> {total_size:,} bytes", info_style))
+        elements.append(Spacer(1, 20))
+        
+        # --- Visual Charts Section ---
+        elements.append(Paragraph("Visual Summary", styles['Heading2']))
+        elements.append(Spacer(1, 8))
+        
+        # Helper to build a horizontal bar chart Drawing
+        def _build_bar_chart(title, items, chart_width=450, bar_height=18):
+            """items: list of (label, count, hex_color)"""
+            total = sum(c for _, c, _ in items)
+            if total == 0:
+                return None
+            row_height = bar_height + 22  # bar + label spacing
+            drawing_height = len(items) * row_height + 30  # +30 for title
+            d = Drawing(chart_width, drawing_height)
+            
+            # Chart title
+            d.add(String(0, drawing_height - 14, title,
+                         fontSize=11, fontName='Helvetica-Bold',
+                         fillColor=colors.HexColor('#1E293B')))
+            
+            y = drawing_height - 36
+            max_bar_w = chart_width - 160  # leave space for labels
+            
+            for label, count, hex_color in items:
+                pct = (count / total) * 100
+                bar_w = max(int((count / total) * max_bar_w), 4)
+                
+                # Label text
+                d.add(String(0, y + 4, f"{label}", fontSize=9, fontName='Helvetica',
+                             fillColor=colors.HexColor('#374151')))
+                
+                # Bar background
+                d.add(Rect(130, y, max_bar_w, bar_height,
+                           fillColor=colors.HexColor('#E5E7EB'), strokeColor=None))
+                # Bar fill
+                d.add(Rect(130, y, bar_w, bar_height,
+                           fillColor=colors.HexColor(hex_color), strokeColor=None))
+                
+                # Percentage label
+                d.add(String(130 + max_bar_w + 6, y + 4,
+                             f"{count} ({pct:.1f}%)", fontSize=8, fontName='Helvetica',
+                             fillColor=colors.HexColor('#6B7280')))
+                y -= row_height
+            
+            return d
+        
+        # 1. File Status Distribution
+        from collections import Counter
+        carved_count = sum(1 for f in all_files if f.get('status') == 'carved')
+        deleted_count = sum(1 for f in all_files if f.get('status') in ('deleted', 'likely_deleted') or f.get('deleted'))
+        active_count = sum(1 for f in all_files if f.get('status') == 'active')
+        other_count = len(all_files) - carved_count - deleted_count - active_count
+        
+        status_items = []
+        if carved_count > 0: status_items.append(("Carved", carved_count, "#F59E0B"))
+        if deleted_count > 0: status_items.append(("Deleted", deleted_count, "#EF4444"))
+        if active_count > 0: status_items.append(("Active", active_count, "#22C55E"))
+        if other_count > 0: status_items.append(("Other", other_count, "#6B7280"))
+        
+        chart = _build_bar_chart("File Status Distribution", status_items)
+        if chart:
+            elements.append(chart)
+            elements.append(Spacer(1, 14))
+        
+        # 2. File Types Breakdown
+        type_counts = Counter(f.get('type', 'unknown') for f in all_files)
+        type_colors = ['#3B82F6', '#8B5CF6', '#EC4899', '#14B8A6', '#F59E0B', '#6366F1', '#9CA3AF']
+        type_items = []
+        for idx, (ftype, cnt) in enumerate(type_counts.most_common(7)):
+            type_items.append((ftype.upper(), cnt, type_colors[idx % len(type_colors)]))
+        
+        chart = _build_bar_chart("File Types Breakdown", type_items)
+        if chart:
+            elements.append(chart)
+            elements.append(Spacer(1, 14))
+        
+        # 3. Integrity Verification
+        verified = sum(1 for f in all_files if f.get('integrity_status') == 'verified')
+        corrupted = sum(1 for f in all_files if f.get('integrity_status') == 'corrupted')
+        unverified = sum(1 for f in all_files if f.get('integrity_status') == 'unverified')
+        no_chk = sum(1 for f in all_files if f.get('integrity_status') == 'no_checksum')
+        
+        integrity_items = []
+        if verified > 0: integrity_items.append(("Verified", verified, "#22C55E"))
+        if corrupted > 0: integrity_items.append(("Corrupted", corrupted, "#EF4444"))
+        if unverified > 0: integrity_items.append(("Unverified", unverified, "#F59E0B"))
+        if no_chk > 0: integrity_items.append(("No Checksum", no_chk, "#6B7280"))
+        
+        chart = _build_bar_chart("Integrity Verification", integrity_items)
+        if chart:
+            elements.append(chart)
+            elements.append(Spacer(1, 14))
+        
+        # --- File Inventory Table ---
+        elements.append(Paragraph("File Inventory", styles['Heading2']))
+        elements.append(Spacer(1, 8))
+        
+        table_data = [['#', 'Name', 'Size', 'Type', 'Status', 'Integrity']]
+        for i, f in enumerate(all_files[:200], 1):  # Cap at 200 rows for PDF
+            size = f.get('size', 0)
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1048576:
+                size_str = f"{size/1024:.1f} KB"
+            else:
+                size_str = f"{size/1048576:.1f} MB"
+            
+            table_data.append([
+                str(i),
+                f.get('name', '')[:40],
+                size_str,
+                f.get('type', '').upper(),
+                f.get('status', ''),
+                f.get('integrity_status', ''),
+            ])
+        
+        table = Table(table_data, colWidths=[30, 180, 60, 45, 65, 70])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1E40AF')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#F9FAFB'), colors.white]),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D1D5DB')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(table)
+        
+        if len(all_files) > 200:
+            elements.append(Spacer(1, 8))
+            elements.append(Paragraph(
+                f"<i>Showing 200 of {len(all_files)} files. Full list available in CSV/JSON format.</i>",
+                info_style
+            ))
+        
+        doc.build(elements)
+    
+    def _generate_text_report(self, session, all_files, report_path: Path):
+        """Fallback plain-text report when reportlab is not available"""
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  UnEarth Forensic Recovery Report")
+        lines.append("=" * 60)
+        lines.append(f"Session ID:  {session.session_id}")
+        lines.append(f"Image:       {session.image_path}")
+        lines.append(f"Filesystem:  {session.fs_type.value}")
+        lines.append(f"Date:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Total Files: {len(all_files)}")
+        lines.append("")
+        lines.append("-" * 60)
+        lines.append(f"{'Name':<35} {'Size':>10} {'Type':<6} {'Status':<10}")
+        lines.append("-" * 60)
+        for f in all_files:
+            name = f.get('name', '')[:34]
+            size = f.get('size', 0)
+            ftype = f.get('type', '')
+            status = f.get('status', '')
+            lines.append(f"{name:<35} {size:>10} {ftype:<6} {status:<10}")
+        lines.append("-" * 60)
+        
+        report_path.write_text('\n'.join(lines))
     
     def get_session_info(self, session_id: str) -> Dict[str, Any]:
         """
