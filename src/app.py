@@ -19,6 +19,7 @@ import zipfile
 import re
 import xml.etree.ElementTree as ET
 from core.btrfs_parser import BtrfsParser
+from core.metadata_extractor import MetadataExtractor
 
 
 class FileSystemType(Enum):
@@ -864,7 +865,19 @@ class UnearthApp:
         return report_path
     
     def _generate_json_report(self, session, all_files, report_path: Path):
-        """Generate JSON report with full session data"""
+        """Generate JSON report with full session data including metadata"""
+        extractor = MetadataExtractor()
+        files_with_meta = []
+        for f in all_files:
+            entry = dict(f)
+            file_path = f.get('path', '')
+            if file_path and os.path.exists(file_path):
+                try:
+                    entry['extracted_metadata'] = extractor.extract(file_path)
+                except Exception:
+                    entry['extracted_metadata'] = None
+            files_with_meta.append(entry)
+        
         report = {
             "report_type": "Unearth Forensic Recovery Report",
             "generated_at": datetime.now().isoformat(),
@@ -880,34 +893,69 @@ class UnearthApp:
                 "carved_count": len(session.carved_files),
                 "total_size": sum(f.get('size', 0) for f in all_files),
             },
-            "files": all_files,
+            "files": files_with_meta,
         }
         with open(report_path, 'w') as f:
             json.dump(report, f, indent=2, default=str)
     
     def _generate_csv_report(self, session, all_files, report_path: Path):
-        """Generate CSV report with file inventory"""
+        """Generate CSV report with file inventory and metadata"""
         import csv
+        import mimetypes
+        extractor = MetadataExtractor()
         
         with open(report_path, 'w', newline='') as f:
             writer = csv.writer(f)
             
             # Header
             writer.writerow([
-                'Name', 'Size (bytes)', 'Type', 'Status',
-                'Integrity', 'Modified', 'Hash', 'Source'
+                'Name', 'Size (bytes)', 'Type', 'MIME Type', 'Status',
+                'Integrity', 'Modified', 'Hash', 'Source', 'Offset',
+                'Inode', 'Permissions', 'UID', 'GID', 'Embedded Metadata'
             ])
             
             for file_info in all_files:
+                # Extract embedded metadata
+                meta_str = ''
+                file_path = file_info.get('path', '')
+                if file_path and os.path.exists(file_path):
+                    try:
+                        embedded = extractor.extract(file_path)
+                        skip = {'file_path', 'file_name', 'file_size', 'error', 'extraction_time'}
+                        parts = []
+                        for k, v in embedded.items():
+                            if k in skip:
+                                continue
+                            if isinstance(v, dict):
+                                for sk, sv in v.items():
+                                    parts.append(f"{sk}={sv}")
+                            elif v is not None:
+                                parts.append(f"{k}={v}")
+                        meta_str = '; '.join(parts)
+                    except Exception:
+                        pass
+                
+                mime_type, _ = mimetypes.guess_type(file_info.get('name', ''))
+                offset = file_info.get('offset', '')
+                if isinstance(offset, int):
+                    offset = f"0x{offset:X}"
+                
                 writer.writerow([
                     file_info.get('name', ''),
                     file_info.get('size', 0),
                     file_info.get('type', ''),
+                    mime_type or '',
                     file_info.get('status', ''),
                     file_info.get('integrity_status', ''),
                     file_info.get('modified', ''),
                     file_info.get('hash', ''),
                     file_info.get('source', ''),
+                    offset,
+                    file_info.get('inode', ''),
+                    file_info.get('mode', ''),
+                    file_info.get('uid', ''),
+                    file_info.get('gid', ''),
+                    meta_str,
                 ])
     
     def _generate_pdf_report(self, session, all_files, report_path: Path):
@@ -1081,6 +1129,126 @@ class UnearthApp:
             elements.append(Spacer(1, 8))
             elements.append(Paragraph(
                 f"<i>Showing 200 of {len(all_files)} files. Full list available in CSV/JSON format.</i>",
+                info_style
+            ))
+        
+        # --- Detailed File Metadata Section ---
+        elements.append(Spacer(1, 20))
+        elements.append(Paragraph("Detailed File Metadata", styles['Heading2']))
+        elements.append(Spacer(1, 6))
+        elements.append(Paragraph(
+            "<i>Embedded metadata extracted from each recovered file (EXIF, PDF properties, Office document info, etc.)</i>",
+            info_style
+        ))
+        elements.append(Spacer(1, 10))
+        
+        import mimetypes
+        extractor = MetadataExtractor()
+        
+        file_heading_style = ParagraphStyle('FileHeading', parent=styles['Heading3'],
+                                             fontSize=11, textColor=colors.HexColor('#1E40AF'),
+                                             spaceBefore=10, spaceAfter=4)
+        meta_style = ParagraphStyle('MetaText', parent=styles['Normal'], fontSize=8,
+                                     textColor=colors.HexColor('#374151'),
+                                     leading=11)
+        
+        for idx, f in enumerate(all_files[:50], 1):  # Cap at 50 files for PDF
+            file_name = f.get('name', 'unknown')
+            file_path = f.get('path', '')
+            
+            elements.append(Paragraph(f"{idx}. {file_name}", file_heading_style))
+            
+            # Build metadata rows
+            meta_rows = []
+            
+            # File identity
+            size = f.get('size', 0)
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1048576:
+                size_str = f"{size/1024:.1f} KB"
+            else:
+                size_str = f"{size/1048576:.1f} MB"
+            
+            mime_type, _ = mimetypes.guess_type(file_name)
+            source = f.get('source', 'recovered' if 'inode' in f else 'carved')
+            
+            meta_rows.append(['File Size', f"{size_str} ({size:,} bytes)"])
+            meta_rows.append(['MIME Type', mime_type or 'application/octet-stream'])
+            meta_rows.append(['Recovery Source', source.title()])
+            meta_rows.append(['SHA-256', f.get('hash', '—')])
+            
+            if f.get('offset') is not None:
+                meta_rows.append(['Disk Offset', f"0x{f['offset']:X}"])
+            if f.get('inode'):
+                meta_rows.append(['Inode', str(f['inode'])])
+            if f.get('mode'):
+                meta_rows.append(['Permissions', f['mode']])
+            if f.get('uid') is not None:
+                meta_rows.append(['UID', str(f['uid'])])
+            if f.get('gid') is not None:
+                meta_rows.append(['GID', str(f['gid'])])
+            if f.get('modified'):
+                meta_rows.append(['Modified', f['modified']])
+            if f.get('accessed'):
+                meta_rows.append(['Accessed', f['accessed']])
+            if f.get('changed'):
+                meta_rows.append(['Changed', f['changed']])
+            if f.get('integrity_status'):
+                meta_rows.append(['Integrity', f['integrity_status']])
+            
+            # Magic bytes
+            if file_path and os.path.exists(file_path):
+                try:
+                    with open(file_path, 'rb') as fh:
+                        magic = fh.read(16)
+                    hex_str = ' '.join(f'{b:02X}' for b in magic)
+                    meta_rows.append(['Magic Bytes', hex_str])
+                except Exception:
+                    pass
+            
+            # Embedded metadata from MetadataExtractor
+            if file_path and os.path.exists(file_path):
+                try:
+                    embedded = extractor.extract(file_path)
+                    if embedded:
+                        skip = {'file_path', 'file_name', 'file_size', 'error', 'extraction_time'}
+                        for key, value in embedded.items():
+                            if key in skip:
+                                continue
+                            if isinstance(value, dict):
+                                for sk, sv in value.items():
+                                    nice_key = sk.replace('_', ' ').title()
+                                    sv_str = str(sv)[:80]
+                                    meta_rows.append([nice_key, sv_str])
+                            elif value is not None:
+                                nice_key = key.replace('_', ' ').title()
+                                v_str = str(value)[:80]
+                                meta_rows.append([nice_key, v_str])
+                except Exception:
+                    pass
+            
+            if meta_rows:
+                # Render as a mini table
+                meta_table = Table(meta_rows, colWidths=[120, 330])
+                meta_table.setStyle(TableStyle([
+                    ('FONTSIZE', (0, 0), (-1, -1), 7),
+                    ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#6B7280')),
+                    ('TEXTCOLOR', (1, 0), (1, -1), colors.HexColor('#111827')),
+                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                    ('ROWBACKGROUNDS', (0, 0), (-1, -1), [colors.HexColor('#F9FAFB'), colors.white]),
+                    ('GRID', (0, 0), (-1, -1), 0.3, colors.HexColor('#E5E7EB')),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('TOPPADDING', (0, 0), (-1, -1), 2),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                ]))
+                elements.append(meta_table)
+                elements.append(Spacer(1, 6))
+        
+        if len(all_files) > 50:
+            elements.append(Spacer(1, 8))
+            elements.append(Paragraph(
+                f"<i>Detailed metadata shown for first 50 of {len(all_files)} files. Full metadata available in JSON format.</i>",
                 info_style
             ))
         

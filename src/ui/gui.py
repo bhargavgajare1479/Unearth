@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QLineEdit, QTextEdit, QComboBox, QCheckBox,
     QStackedWidget, QListWidget, QListWidgetItem, QFileDialog,
     QMessageBox, QProgressBar, QDialog, QDialogButtonBox, QScrollArea,
-    QGridLayout, QSizePolicy
+    QGridLayout, QSizePolicy, QSplitter
 )
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
@@ -47,6 +47,7 @@ try:
         list_xfs_btrfs_partitions, list_external_drives,
         format_bytes, check_root_permissions
     )
+    from core.metadata_extractor import MetadataExtractor
     BACKEND_AVAILABLE = True
 except ImportError as e:
     print(f"Backend not available: {e}")
@@ -937,6 +938,8 @@ class UnearthGUI(QMainWindow):
         # Refresh all data views
         self.refresh_recovered_files()
         self.refresh_timeline()
+        self.refresh_integrity_view()
+        self.refresh_metadata_view()
     
     def scan_error(self, error):
         """Handle scan error"""
@@ -1952,90 +1955,421 @@ class UnearthGUI(QMainWindow):
         self.search_results.setHtml(html)
     
     def create_integrity_view(self):
-        """Create integrity view"""
+        """Create integrity verification view with per-file hash table"""
         view = QWidget()
         layout = QVBoxLayout(view)
         layout.setContentsMargins(30, 25, 30, 30)
+        layout.setSpacing(15)
         
         title = QLabel("File Integrity Verification")
         title.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
         title.setStyleSheet("color: #FFFFFF;")
         layout.addWidget(title)
         
-        text = QTextEdit()
-        text.setReadOnly(True)
-        
-        total = len(self.recovered_files) + len(self.carved_files)
-        html = f"""
-        <h3 style='color: #3B82F6;'>Integrity Verification Status</h3>
-        <br/>
-        <p style='color: #FFFFFF;'><strong>Total Files:</strong> {total}</p>
-        <p style='color: #FFFFFF;'><strong>Hash Algorithm:</strong> SHA-256</p>
-        <p style='color: #FFFFFF;'><strong>Status:</strong> <span style='color: #10B981;'>✓ All files hashed</span></p>
-        <br/>
-        <p style='color: #9CA3AF;'>All recovered files have been cryptographically hashed using SHA-256 for integrity verification. These hashes can be used to verify that files have not been modified since recovery.</p>
-        <br/>
-        <p style='color: #9CA3AF;'><strong>Forensic Use:</strong> Hashes are included in all generated reports and provide evidence of data integrity in legal proceedings.</p>
-        """
-        text.setHtml(html)
-        text.setStyleSheet("""
-            QTextEdit {
+        # Summary section
+        self.integrity_summary = QLabel("No files scanned yet. Attach a source and run a scan to see integrity results.")
+        self.integrity_summary.setWordWrap(True)
+        self.integrity_summary.setStyleSheet("""
+            QLabel {
+                color: #9CA3AF;
                 background-color: #1E1E2E;
-                color: #FFFFFF;
                 border: 1px solid #2A2F3A;
-                border-radius: 8px;
-                padding: 15px;
+                border-radius: 10px;
+                padding: 18px;
+                font-size: 13px;
             }
         """)
-        layout.addWidget(text)
+        layout.addWidget(self.integrity_summary)
+        
+        # Per-file integrity table
+        self.integrity_table = QTableWidget()
+        self.integrity_table.setColumnCount(4)
+        self.integrity_table.setHorizontalHeaderLabels(['File Name', 'SHA-256 Hash', 'Status', 'Details'])
+        self.integrity_table.horizontalHeader().setStretchLastSection(True)
+        self.integrity_table.horizontalHeader().setSectionResizeMode(0, self.integrity_table.horizontalHeader().ResizeMode.Interactive)
+        self.integrity_table.horizontalHeader().setSectionResizeMode(1, self.integrity_table.horizontalHeader().ResizeMode.Stretch)
+        self.integrity_table.setColumnWidth(0, 220)
+        self.integrity_table.setColumnWidth(2, 110)
+        self.integrity_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.integrity_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.integrity_table.setAlternatingRowColors(True)
+        self.integrity_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #1E1E2E;
+                alternate-background-color: #232333;
+                color: #FFFFFF;
+                gridline-color: #2A2F3A;
+                border: 1px solid #2A2F3A;
+                border-radius: 8px;
+            }
+            QHeaderView::section {
+                background-color: #2A2F3A;
+                color: #FFFFFF;
+                padding: 10px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 6px;
+            }
+            QTableWidget::item:selected {
+                background-color: #3B82F6;
+            }
+        """)
+        layout.addWidget(self.integrity_table)
         
         return view
     
+    def refresh_integrity_view(self):
+        """Refresh integrity table with real per-file hash and verification data"""
+        all_files = self.recovered_files + self.carved_files
+        
+        if not all_files:
+            self.integrity_summary.setText("No files scanned yet. Attach a source and run a scan to see integrity results.")
+            self.integrity_table.setRowCount(0)
+            return
+        
+        # Count statuses
+        counts = {'verified': 0, 'corrupted': 0, 'unverified': 0, 'no_checksum': 0}
+        for f in all_files:
+            status = f.get('integrity_status', 'unverified')
+            counts[status] = counts.get(status, 0) + 1
+        
+        total = len(all_files)
+        summary_parts = [
+            f"<b style='color:#FFFFFF;'>Total Files:</b> {total}",
+            f"&nbsp;&nbsp;│&nbsp;&nbsp;<b style='color:#FFFFFF;'>Algorithm:</b> SHA-256",
+        ]
+        status_parts = []
+        if counts['verified']:
+            status_parts.append(f"<span style='color:#10B981;'>✓ {counts['verified']} Verified</span>")
+        if counts['corrupted']:
+            status_parts.append(f"<span style='color:#EF4444;'>✗ {counts['corrupted']} Corrupted</span>")
+        if counts['unverified']:
+            status_parts.append(f"<span style='color:#F59E0B;'>? {counts['unverified']} Unverified</span>")
+        if counts['no_checksum']:
+            status_parts.append(f"<span style='color:#6B7280;'>— {counts['no_checksum']} No Checksum</span>")
+        
+        summary_html = " &nbsp;│&nbsp; ".join(summary_parts)
+        summary_html += "<br/>" + " &nbsp;&nbsp;│&nbsp;&nbsp; ".join(status_parts)
+        self.integrity_summary.setText(summary_html)
+        self.integrity_summary.setTextFormat(Qt.TextFormat.RichText)
+        
+        # Populate table
+        self.integrity_table.setRowCount(total)
+        for i, f in enumerate(all_files):
+            # File name
+            self.integrity_table.setItem(i, 0, QTableWidgetItem(f.get('name', 'unknown')))
+            
+            # SHA-256 hash
+            file_hash = f.get('hash', '')
+            hash_item = QTableWidgetItem(file_hash if file_hash else '—')
+            hash_item.setFont(QFont("Consolas", 9))
+            hash_item.setForeground(QColor("#9CA3AF"))
+            self.integrity_table.setItem(i, 1, hash_item)
+            
+            # Status with color
+            status = f.get('integrity_status', 'unverified')
+            status_map = {
+                'verified':    ('✓ Verified',    '#10B981'),
+                'corrupted':   ('✗ Corrupted',   '#EF4444'),
+                'unverified':  ('? Unverified',  '#F59E0B'),
+                'no_checksum': ('— No Checksum', '#6B7280'),
+            }
+            label, color = status_map.get(status, ('? Unknown', '#6B7280'))
+            status_item = QTableWidgetItem(label)
+            status_item.setForeground(QColor(color))
+            status_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            self.integrity_table.setItem(i, 2, status_item)
+            
+            # Details
+            details = f.get('integrity_details', '')
+            self.integrity_table.setItem(i, 3, QTableWidgetItem(details if details else '—'))
+    
     def create_metadata_view(self):
-        """Create metadata view"""
+        """Create metadata view with file list and detail panel"""
         view = QWidget()
         layout = QVBoxLayout(view)
-        layout.setContentsMargins(30, 25, 30, 30)
+        layout.setContentsMargins(20, 10, 20, 10)
+        layout.setSpacing(5)
         
         title = QLabel("Metadata Extraction")
-        title.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
+        title.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
         title.setStyleSheet("color: #FFFFFF;")
+        title.setFixedHeight(30)
         layout.addWidget(title)
         
-        text = QTextEdit()
-        text.setReadOnly(True)
+        # Summary label
+        self.metadata_summary = QLabel("No files scanned yet. Attach a source and run a scan to see metadata.")
+        self.metadata_summary.setWordWrap(True)
+        self.metadata_summary.setStyleSheet("""
+            QLabel {
+                color: #9CA3AF;
+                background-color: #1E1E2E;
+                border: 1px solid #2A2F3A;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }
+        """)
+        self.metadata_summary.setFixedHeight(40)
+        layout.addWidget(self.metadata_summary)
         
-        total = len(self.recovered_files) + len(self.carved_files)
-        html = f"""
-        <h3 style='color: #3B82F6;'>Metadata Extraction Summary</h3>
-        <br/>
-        <p style='color: #FFFFFF;'><strong>Files Analyzed:</strong> {total}</p>
-        <br/>
-        <h4 style='color: #FFFFFF;'>Extracted Metadata Includes:</h4>
-        <ul style='color: #9CA3AF; line-height: 1.8;'>
-            <li>File system timestamps (created, modified, accessed)</li>
-            <li>File permissions and ownership information</li>
-            <li>Inode numbers and filesystem-specific data</li>
-            <li>Embedded metadata (EXIF for images, author for documents)</li>
-            <li>Cryptographic hashes (SHA-256)</li>
-            <li>File size and type information</li>
-        </ul>
-        <br/>
-        <p style='color: #9CA3AF;'><strong>Forensic Value:</strong> All extracted metadata is preserved in the forensic report and can be used to establish timelines, identify file origins, and verify authenticity.</p>
-        """
-        text.setHtml(html)
-        text.setStyleSheet("""
+        # Split pane: file list (left) + detail (right)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # Left: file list
+        self.metadata_file_list = QTableWidget()
+        self.metadata_file_list.setColumnCount(3)
+        self.metadata_file_list.setHorizontalHeaderLabels(['File Name', 'Size', 'Type'])
+        self.metadata_file_list.horizontalHeader().setStretchLastSection(True)
+        self.metadata_file_list.setColumnWidth(0, 250)
+        self.metadata_file_list.setColumnWidth(1, 90)
+        self.metadata_file_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.metadata_file_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.metadata_file_list.setAlternatingRowColors(True)
+        self.metadata_file_list.setStyleSheet("""
+            QTableWidget {
+                background-color: #1E1E2E;
+                alternate-background-color: #232333;
+                color: #FFFFFF;
+                gridline-color: #2A2F3A;
+                border: 1px solid #2A2F3A;
+                border-radius: 8px;
+            }
+            QHeaderView::section {
+                background-color: #2A2F3A;
+                color: #FFFFFF;
+                padding: 10px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 6px;
+            }
+            QTableWidget::item:selected {
+                background-color: #3B82F6;
+            }
+        """)
+        self.metadata_file_list.currentCellChanged.connect(self.on_metadata_file_selected)
+        splitter.addWidget(self.metadata_file_list)
+        
+        # Right: metadata detail
+        self.metadata_detail = QTextEdit()
+        self.metadata_detail.setReadOnly(True)
+        self.metadata_detail.setStyleSheet("""
             QTextEdit {
                 background-color: #1E1E2E;
                 color: #FFFFFF;
                 border: 1px solid #2A2F3A;
                 border-radius: 8px;
                 padding: 15px;
+                font-size: 13px;
             }
         """)
-        layout.addWidget(text)
+        self.metadata_detail.setHtml("<p style='color:#6B7280;'>Select a file from the list to view its extracted metadata.</p>")
+        splitter.addWidget(self.metadata_detail)
+        
+        splitter.setSizes([400, 600])
+        splitter.setStyleSheet("QSplitter::handle { background-color: #2A2F3A; width: 2px; }")
+        layout.addWidget(splitter)
+        
+        # Initialize extractor
+        self.metadata_extractor = MetadataExtractor() if BACKEND_AVAILABLE else None
         
         return view
+    
+    def refresh_metadata_view(self):
+        """Populate the metadata file list from recovered/carved files"""
+        all_files = self.recovered_files + self.carved_files
+        
+        if not all_files:
+            self.metadata_summary.setText("No files scanned yet. Attach a source and run a scan to see metadata.")
+            self.metadata_file_list.setRowCount(0)
+            self.metadata_detail.setHtml("<p style='color:#6B7280;'>No files available.</p>")
+            return
+        
+        total = len(all_files)
+        self.metadata_summary.setText(f"<b style='color:#FFFFFF;'>Files Available:</b> {total} &nbsp;│&nbsp; <span style='color:#9CA3AF;'>Select a file to extract and view its embedded metadata (EXIF, PDF info, Office properties, timestamps, etc.)</span>")
+        self.metadata_summary.setTextFormat(Qt.TextFormat.RichText)
+        
+        self.metadata_file_list.setRowCount(total)
+        for i, f in enumerate(all_files):
+            self.metadata_file_list.setItem(i, 0, QTableWidgetItem(f.get('name', 'unknown')))
+            self.metadata_file_list.setItem(i, 1, QTableWidgetItem(self._format_size(f.get('size', 0))))
+            self.metadata_file_list.setItem(i, 2, QTableWidgetItem(f.get('type', 'unknown')))
+        
+        self.metadata_detail.setHtml("<p style='color:#6B7280;'>Select a file from the list to view its extracted metadata.</p>")
+    
+    def on_metadata_file_selected(self, row, col=0, prev_row=0, prev_col=0):
+        """Handle file selection in metadata view — extract and display metadata"""
+        if row < 0:
+            return
+        
+        all_files = self.recovered_files + self.carved_files
+        if row >= len(all_files):
+            return
+        
+        file_info = all_files[row]
+        file_path = file_info.get('path', '')
+        file_name = file_info.get('name', 'unknown')
+        
+        ROW = "<tr><td style='padding:5px 10px; color:#9CA3AF; width:160px; vertical-align:top;'><b>{}</b></td><td style='padding:5px 10px;'>{}</td></tr>"
+        SECTION = "<br/><h4 style='color:{}; margin-bottom:6px;'>{}</h4>"
+        TABLE_OPEN = "<table style='color:#D1D5DB; width:100%; border-collapse:collapse;'>"
+        TABLE_CLOSE = "</table>"
+        
+        html = []
+        html.append(f"<h3 style='color:#3B82F6; margin-bottom:2px;'>{file_name}</h3>")
+        html.append("<hr style='border-color:#2A2F3A;'/>")
+        
+        # ── Section 1: File Identity ──
+        html.append(SECTION.format('#FFFFFF', '🏷️ File Identity'))
+        html.append(TABLE_OPEN)
+        html.append(ROW.format('File Name', file_name))
+        html.append(ROW.format('File Size', self._format_size(file_info.get('size', 0))))
+        html.append(ROW.format('File Size (bytes)', f"{file_info.get('size', 0):,} bytes"))
+        html.append(ROW.format('File Extension', file_info.get('type', '—')))
+        
+        # MIME type detection
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(file_name)
+        html.append(ROW.format('MIME Type', mime_type or 'application/octet-stream'))
+        
+        # File magic bytes (first 16 bytes as hex)
+        if file_path and os.path.exists(file_path):
+            try:
+                with open(file_path, 'rb') as f:
+                    magic = f.read(16)
+                hex_str = ' '.join(f'{b:02X}' for b in magic)
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in magic)
+                html.append(ROW.format('Magic Bytes', f"<code style='color:#F59E0B;'>{hex_str}</code>"))
+                html.append(ROW.format('ASCII Preview', f"<code>{ascii_str}</code>"))
+            except Exception:
+                pass
+        
+        html.append(ROW.format('SHA-256 Hash', f"<code style='font-size:11px;'>{file_info.get('hash', '—')}</code>"))
+        html.append(TABLE_CLOSE)
+        
+        # ── Section 2: Recovery Details ──
+        html.append(SECTION.format('#FFFFFF', '🔧 Recovery Details'))
+        html.append(TABLE_OPEN)
+        source = file_info.get('source', 'recovered' if 'inode' in file_info else 'carved')
+        source_display = f"<span style='color:{'#10B981' if source == 'recovered' else '#F59E0B'};'>{'📂 Filesystem Recovery' if source == 'recovered' else '🔪 File Carving'}</span>"
+        html.append(ROW.format('Recovery Source', source_display))
+        
+        status = file_info.get('status', '—')
+        if status == 'deleted':
+            status_display = "<span style='color:#EF4444;'>🗑️ Deleted</span>"
+        elif status == 'active':
+            status_display = "<span style='color:#10B981;'>✓ Active</span>"
+        else:
+            status_display = f"<span style='color:#F59E0B;'>{status}</span>"
+        html.append(ROW.format('File Status', status_display))
+        
+        # Carving-specific fields
+        if file_info.get('offset') is not None:
+            offset_val = file_info['offset']
+            html.append(ROW.format('Disk Offset', f"0x{offset_val:X} ({offset_val:,} bytes)"))
+        if file_info.get('is_duplicate') is not None:
+            dup_str = "Yes — duplicate of active file" if file_info['is_duplicate'] else "No"
+            html.append(ROW.format('Duplicate', dup_str))
+        
+        # Recovery-specific fields
+        if file_info.get('inode'):
+            html.append(ROW.format('Inode', str(file_info['inode'])))
+        if file_info.get('nlink') is not None:
+            html.append(ROW.format('Hard Links', str(file_info['nlink'])))
+        if file_info.get('extents') is not None:
+            html.append(ROW.format('Data Extents', str(file_info['extents'])))
+        if file_info.get('original_name'):
+            html.append(ROW.format('Original Name', file_info['original_name']))
+        
+        # Integrity
+        integrity = file_info.get('integrity_status', '—')
+        integrity_map = {
+            'verified': ('✓ Verified', '#10B981'),
+            'corrupted': ('✗ Corrupted', '#EF4444'),
+            'unverified': ('? Unverified', '#F59E0B'),
+            'no_checksum': ('— No Checksum', '#6B7280'),
+        }
+        ilabel, icolor = integrity_map.get(integrity, (integrity, '#6B7280'))
+        html.append(ROW.format('Integrity', f"<span style='color:{icolor};'>{ilabel}</span>"))
+        if file_info.get('integrity_details'):
+            html.append(ROW.format('Integrity Detail', file_info['integrity_details']))
+        
+        html.append(TABLE_CLOSE)
+        
+        # ── Section 3: Filesystem Metadata (if available) ──
+        has_fs_meta = any(file_info.get(k) for k in ('mode', 'uid', 'gid', 'modified', 'accessed', 'changed'))
+        if has_fs_meta:
+            html.append(SECTION.format('#FFFFFF', '📁 Filesystem Metadata'))
+            html.append(TABLE_OPEN)
+            if file_info.get('mode'):
+                html.append(ROW.format('Permissions', file_info['mode']))
+            if file_info.get('uid') is not None:
+                html.append(ROW.format('Owner (UID)', str(file_info['uid'])))
+            if file_info.get('gid') is not None:
+                html.append(ROW.format('Group (GID)', str(file_info['gid'])))
+            if file_info.get('modified'):
+                html.append(ROW.format('Modified', file_info['modified']))
+            if file_info.get('accessed'):
+                html.append(ROW.format('Accessed', file_info['accessed']))
+            if file_info.get('changed'):
+                html.append(ROW.format('Changed', file_info['changed']))
+            html.append(TABLE_CLOSE)
+        
+        # ── Section 4: OS-level file stats ──
+        if file_path and os.path.exists(file_path):
+            try:
+                stat = os.stat(file_path)
+                html.append(SECTION.format('#FFFFFF', '💾 On-Disk File Info'))
+                html.append(TABLE_OPEN)
+                html.append(ROW.format('Saved Path', f"<code style='font-size:11px;'>{file_path}</code>"))
+                html.append(ROW.format('Disk Size', self._format_size(stat.st_size)))
+                html.append(ROW.format('Last Modified', datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')))
+                html.append(ROW.format('Last Accessed', datetime.fromtimestamp(stat.st_atime).strftime('%Y-%m-%d %H:%M:%S')))
+                html.append(TABLE_CLOSE)
+            except Exception:
+                pass
+        
+        # ── Section 5: Embedded Metadata (from MetadataExtractor) ──
+        if self.metadata_extractor and file_path and os.path.exists(file_path):
+            try:
+                embedded = self.metadata_extractor.extract(file_path)
+                if embedded:
+                    # Flatten nested dicts for display
+                    flat = {}
+                    skip_keys = {'file_path', 'file_name', 'file_size', 'error'}
+                    for key, value in embedded.items():
+                        if key in skip_keys:
+                            continue
+                        if isinstance(value, dict):
+                            for sub_key, sub_val in value.items():
+                                nice_key = sub_key.replace('_', ' ').title()
+                                flat[nice_key] = sub_val
+                        elif value is not None:
+                            nice_key = key.replace('_', ' ').title()
+                            flat[nice_key] = value
+                    
+                    if flat:
+                        html.append(SECTION.format('#FFFFFF', '🔍 Embedded Metadata'))
+                        html.append(TABLE_OPEN)
+                        for key, value in flat.items():
+                            display_val = str(value)
+                            if len(display_val) > 300:
+                                display_val = display_val[:300] + '…'
+                            html.append(ROW.format(key, display_val))
+                        html.append(TABLE_CLOSE)
+                    else:
+                        html.append(SECTION.format('#6B7280', '🔍 Embedded Metadata'))
+                        html.append("<p style='color:#6B7280;'>No embedded metadata found in this file type.</p>")
+            except Exception as e:
+                html.append(f"<br/><p style='color:#EF4444;'>Error extracting metadata: {e}</p>")
+        elif not file_path or not os.path.exists(file_path):
+            html.append("<br/><p style='color:#6B7280;'>File not found on disk — cannot extract embedded metadata.</p>")
+        
+        self.metadata_detail.setHtml("".join(html))
     
     def create_report_view(self):
         """Create report generator view"""
