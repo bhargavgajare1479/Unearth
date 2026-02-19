@@ -944,9 +944,45 @@ class UnearthGUI(QMainWindow):
     
 
     def update_dashboard(self, source_path, source_type):
-        """Update dashboard with session info"""
-        # This would update the dashboard view with current session info
-        pass
+        """Update dashboard when a session starts (before scan completes).
+        
+        Sets the dashboard into a 'scanning in progress' state:
+        - Hides the welcome section
+        - Shows progress bar and results section
+        - Populates session details with source info
+        - Sets stat cards to 'scanning' placeholder
+        """
+        # Transition from welcome to active dashboard
+        self.welcome_section.setVisible(False)
+        self.progress_container.setVisible(True)
+        self.results_section.setVisible(True)
+        
+        # Set stat cards to scanning placeholders
+        self.total_card.findChild(QLabel, "value").setText("...")
+        self.deleted_card.findChild(QLabel, "value").setText("...")
+        self.active_card.findChild(QLabel, "value").setText("...")
+        self.carved_card.findChild(QLabel, "value").setText("...")
+        
+        # Get filesystem type from session if available
+        fs_type = "Detecting..."
+        if self.current_session and self.app:
+            session = self.app.sessions.get(self.current_session)
+            if session and session.fs_type:
+                fs_type = session.fs_type.value.upper()
+        
+        # Populate session info with what we know so far
+        self.session_details.setText(
+            f"Source: {source_path}\n"
+            f"Type: {source_type}\n"
+            f"Filesystem: {fs_type}\n"
+            f"Session: {self.current_session[:16] if self.current_session else 'N/A'}...\n"
+            f"Status: Scanning in progress..."
+        )
+        
+        # Reset charts to empty state
+        self.status_chart_container._chart_widget.set_data([])
+        self.type_chart_container._chart_widget.set_data([])
+        self.integrity_chart_container._chart_widget.set_data([])
     
     # View Creators
     
@@ -1045,8 +1081,7 @@ class UnearthGUI(QMainWindow):
                 background-color: #3B82F6;
             }
         """)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%p%")  # Show only the percentage on the bar
+        self.progress_bar.setTextVisible(False)
         progress_layout.addWidget(self.progress_bar)
         
         self.progress_container.setVisible(False)
