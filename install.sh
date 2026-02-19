@@ -285,7 +285,7 @@ create_desktop_entry() {
         
         cat > "$DESKTOP_DIR/unearth.desktop" << EOF
 [Desktop Entry]
-Name=UnEarth Forensics
+Name=Unearth Forensics
 Comment=Forensic Data Recovery Tool
 Exec=${HOME}/.local/bin/unearth-gui
 Icon=${INSTALL_DIR}/icon.png
@@ -329,7 +329,7 @@ print_completion() {
 main() {
     print_banner
     
-    print_info "Starting UnEarth installation..."
+    print_info "Starting Unearth installation..."
     echo ""
     
     # Run installation steps

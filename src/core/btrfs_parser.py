@@ -280,9 +280,12 @@ class BtrfsParser:
         self.superblock: Optional[BtrfsSuperblock] = None
         self.file_handle = None
         
-        # Cache for performance
-        self.inode_cache: Dict[int, BtrfsInodeItem] = {}
-        self.extent_cache: Dict[int, List[BtrfsExtentData]] = {}
+        # Cache for performance — multi-generation for deleted file recovery
+        # inode_cache: objectid -> {generation: BtrfsInodeItem}
+        # This allows us to keep ALL versions of an inode across COW generations
+        self.inode_cache: Dict[int, Dict[int, BtrfsInodeItem]] = {}
+        # extent_cache: objectid -> {generation: [BtrfsExtentData, ...]}
+        self.extent_cache: Dict[int, Dict[int, List[BtrfsExtentData]]] = {}
         self.name_cache: Dict[int, str] = {}
         self.chunks: List[BtrfsChunk] = []
         self.found_leaves = []
@@ -297,6 +300,9 @@ class BtrfsParser:
         self.csum_size: int = 4  # Bytes per checksum (CRC32 = 4)
         self.sector_size: int = BTRFS_DEFAULT_SECTOR_SIZE  # Usually 4096
         self.csum_cache: Dict[int, bytes] = {}  # disk_bytenr -> checksum bytes
+        
+        # Auto-detected offset style for item data parsing (set during first leaf scan)
+        self._offset_style: Optional[int] = None
         
         # Verification statistics
         self.verification_stats = {
@@ -1065,10 +1071,24 @@ class BtrfsParser:
         
         This includes both live (current) and deleted (orphaned) inodes.
         Deleted files may still have metadata in old/orphaned leaf nodes.
+        
+        IMPORTANT: Clears ALL caches before scanning to ensure fresh results.
+        This guarantees that newly deleted files are always detected.
         """
         if not self.superblock:
             self.parse_superblock()
 
+        # === CRITICAL: Clear ALL caches for a fresh scan ===
+        # Without this, re-runs would skip the scan and miss newly deleted files
+        self.inode_cache.clear()
+        self.extent_cache.clear()
+        self.name_cache.clear()
+        self.dir_cache.clear()
+        self.parent_cache.clear()
+        self.orphan_inodes.clear()
+        self.csum_cache.clear()
+        self._offset_style = None  # Reset auto-detected offset style
+        
         nodesize = self.superblock.nodesize
         sectorsize = self.superblock.sectorsize
         total_size = self.superblock.total_bytes
@@ -1090,6 +1110,7 @@ class BtrfsParser:
         
         leaves_found = 0
         fs_tree_leaves = 0
+        subvol_tree_leaves = 0
         
         while current_offset < total_size:
             progress_pct = int(current_offset / total_size * 100)
@@ -1098,12 +1119,18 @@ class BtrfsParser:
                 
             try:
                 self.file_handle.seek(self.offset + current_offset)
-                chunk = self.file_handle.read(chunk_size)
+                # Read chunk_size + nodesize to cover nodes straddling the chunk boundary
+                # This ensures we never miss a leaf node that starts near the end of a chunk
+                read_size = min(chunk_size + nodesize, total_size - current_offset)
+                chunk = self.file_handle.read(read_size)
                 if not chunk:
                     break
                 
                 # Iterate through chunk in sectorsize steps to catch all potential nodes
-                for i in range(0, len(chunk), scan_step):
+                # But only process up to chunk_size offset to avoid double-processing
+                # (the overlap region will be re-read in the next iteration)
+                process_limit = min(chunk_size, len(chunk))
+                for i in range(0, process_limit, scan_step):
                     if i + nodesize > len(chunk):
                         break
                     
@@ -1120,9 +1147,11 @@ class BtrfsParser:
                         if header.level == 0 and header.nritems > 0:  # Valid leaf node
                             leaves_found += 1
                             
-                            # Track if this is from the FS tree (owner=5)
+                            # Track tree type for logging
                             if header.owner == 5:  # BTRFS_FS_TREE_OBJECTID
                                 fs_tree_leaves += 1
+                            elif header.owner >= 256:  # Subvolume trees
+                                subvol_tree_leaves += 1
                             
                             self.process_leaf(block, header)
                             
@@ -1133,28 +1162,128 @@ class BtrfsParser:
             except Exception as e:
                 self.logger.error(f"Error scanning at offset {current_offset}: {e}")
             
+            # Advance by chunk_size (NOT chunk_size + nodesize)
+            # The overlap ensures nodes at boundaries are covered
             current_offset += chunk_size
             
-        self.logger.info(f"Scan complete. Found {leaves_found} leaf nodes ({fs_tree_leaves} from FS tree).")
-        self.logger.info(f"Parsed {len(self.inode_cache)} inodes, {len(self.extent_cache)} extents, {len(self.name_cache)} filenames.")
+        self.logger.info(f"Scan complete. Found {leaves_found} leaf nodes "
+                        f"({fs_tree_leaves} FS tree, {subvol_tree_leaves} subvolume tree).")
+        
+        # Count total inode versions and extent versions across all generations
+        total_inode_versions = sum(len(gens) for gens in self.inode_cache.values())
+        total_extent_versions = sum(len(gens) for gens in self.extent_cache.values())
+        self.logger.info(f"Parsed {len(self.inode_cache)} unique inodes ({total_inode_versions} versions), "
+                         f"{total_extent_versions} extent groups, {len(self.name_cache)} filenames.")
         self.logger.info(f"Directory entries: {len(self.dir_cache)}, Parent refs: {len(self.parent_cache)}, Orphans: {len(self.orphan_inodes)}")
         
         # Log orphan inodes if any found
         if self.orphan_inodes:
             self.logger.info(f"Orphan inodes found: {list(self.orphan_inodes)[:10]}...")  # First 10
         
+        # Log multi-generation inodes (potential deleted files)
+        multi_gen_inodes = {k: v for k, v in self.inode_cache.items() if len(v) > 1}
+        if multi_gen_inodes:
+            self.logger.info(f"Multi-generation inodes: {len(multi_gen_inodes)} (potential deleted files)")
+            for ino, gens in list(multi_gen_inodes.items())[:5]:
+                gen_list = sorted(gens.keys())
+                self.logger.debug(f"  Inode {ino}: {len(gens)} versions, generations={gen_list}")
+        
         return list(self.inode_cache.keys())
+
+    def _detect_offset_style(self, block: bytes, header: BtrfsHeader) -> int:
+        """
+        Auto-detect whether item offsets need BTRFS_LEAF_DATA_OFFSET added.
+        
+        Tests both interpretations against the first item in the leaf and
+        returns the adjustment that produces a valid parse.
+        
+        Returns:
+            101 if offsets are relative to header end (standard Btrfs spec)
+            0 if offsets are absolute from byte 0
+        """
+        BTRFS_LEAF_DATA_OFFSET = 101
+        nodesize = len(block)
+        
+        if header.nritems == 0:
+            return BTRFS_LEAF_DATA_OFFSET  # Default
+        
+        # Read the first item's key, offset, and size
+        offset = BTRFS_LEAF_DATA_OFFSET  # Item headers start after the 101-byte header
+        key = self.parse_btrfs_key(block, offset)
+        stored_offset = struct.unpack('<I', block[offset+17:offset+21])[0]
+        item_data_size = struct.unpack('<I', block[offset+21:offset+25])[0]
+        
+        if item_data_size == 0:
+            return BTRFS_LEAF_DATA_OFFSET  # Can't test, use default
+        
+        # Test both interpretations
+        for adj in [BTRFS_LEAF_DATA_OFFSET, 0]:
+            actual_offset = adj + stored_offset
+            if actual_offset >= nodesize or actual_offset + item_data_size > nodesize:
+                continue
+            
+            data = block[actual_offset : actual_offset + item_data_size]
+            
+            # For INODE_ITEM_KEY, validate the parsed result
+            if key.type == BTRFS_INODE_ITEM_KEY and item_data_size >= 160:
+                try:
+                    inode = self.parse_inode_item(data)
+                    file_type = (inode.mode >> 12) & 0xF
+                    # Valid file types: 1=FIFO, 2=chardev, 4=dir, 6=blockdev, 8=file, 10=symlink, 12=socket
+                    if file_type in (1, 2, 4, 6, 8, 10, 12) and inode.nlink <= 65536:
+                        self.logger.debug(f"Offset auto-detect: adjustment={adj} (file_type={file_type}, nlink={inode.nlink})")
+                        return adj
+                except Exception:
+                    continue
+            
+            # For EXTENT_DATA_KEY, check if extent type is valid
+            elif key.type == BTRFS_EXTENT_DATA_KEY and item_data_size >= 21:
+                try:
+                    extent = self.parse_extent_data(data)
+                    if extent.type in (BTRFS_FILE_EXTENT_INLINE, BTRFS_FILE_EXTENT_REG, BTRFS_FILE_EXTENT_PREALLOC):
+                        self.logger.debug(f"Offset auto-detect: adjustment={adj} (extent_type={extent.type})")
+                        return adj
+                except Exception:
+                    continue
+            
+            # For INODE_REF, check if name_len is reasonable
+            elif key.type == BTRFS_INODE_REF_KEY and item_data_size >= 10:
+                name_len = struct.unpack('<H', data[8:10])[0]
+                if name_len > 0 and 10 + name_len <= item_data_size and name_len < 256:
+                    # Check if the name bytes look like valid UTF-8
+                    try:
+                        name = data[10:10+name_len].decode('utf-8')
+                        if name.isprintable() or any(c.isalnum() for c in name):
+                            self.logger.debug(f"Offset auto-detect: adjustment={adj} (name='{name}')")
+                            return adj
+                    except UnicodeDecodeError:
+                        continue
+        
+        # Default: standard Btrfs spec says offsets are relative to header end
+        return BTRFS_LEAF_DATA_OFFSET
 
     def process_leaf(self, block: bytes, header: BtrfsHeader):
         """
         Process a leaf node to extract items.
         
-        IMPORTANT: In Btrfs, item data offsets in leaf nodes are stored as offsets
-        from the END of the leaf (i.e., nodesize - offset = actual position).
-        The items grow from the end of the block backwards.
+        In Btrfs, item data offsets stored in leaf item headers are relative to
+        BTRFS_LEAF_DATA_OFFSET (= sizeof(struct btrfs_header) = 101 bytes).
+        Item data grows BACKWARDS from the end of the node block.
+        
+        The offset style is auto-detected on first leaf and cached for the scan.
         """
+        BTRFS_LEAF_DATA_OFFSET = 101  # sizeof(struct btrfs_header)
+        
+        # Auto-detect offset style on first leaf, then cache the result
+        if not hasattr(self, '_offset_style') or self._offset_style is None:
+            self._offset_style = self._detect_offset_style(block, header)
+            self.logger.info(f"Auto-detected item offset adjustment: {self._offset_style} "
+                           f"({'relative to header end' if self._offset_style == 101 else 'absolute from block start'})")
+        
+        offset_adjustment = self._offset_style
+        leaf_generation = header.generation  # Track which generation this leaf belongs to
         nodesize = len(block)  # Should be self.superblock.nodesize
-        offset = 101  # Header size (csum=32 + fsid=16 + bytenr=8 + flags=8 + level=1 + nritems=4 + gen=8 + tree_id=8 + checksum padding)
+        offset = BTRFS_LEAF_DATA_OFFSET  # Item headers always start after the 101-byte header
         
         for item_idx in range(header.nritems):
             # Item header: Key (17) + data_offset (4) + data_size (4) = 25 bytes
@@ -1163,21 +1292,22 @@ class BtrfsParser:
                 
             key = self.parse_btrfs_key(block, offset)
             
-            # Read item offset and size
-            # CRITICAL: item_offset is relative to the START of the leaf block in modern Btrfs
-            # It points to where the item data begins
-            item_data_offset = struct.unpack('<I', block[offset+17:offset+21])[0]
+            # Read stored offset and size from item header
+            stored_offset = struct.unpack('<I', block[offset+17:offset+21])[0]
             item_data_size = struct.unpack('<I', block[offset+21:offset+25])[0]
+            
+            # Calculate actual byte position using auto-detected adjustment
+            item_data_offset = offset_adjustment + stored_offset
             
             offset += 25  # Move to next item header
             
-            # Validate offset and size
+            # Validate offset and size against actual block boundaries
             if item_data_offset >= nodesize or item_data_offset + item_data_size > nodesize:
                 continue
             if item_data_size == 0:
                 continue
                 
-            # Extract item data
+            # Extract item data from the correct position
             item_data = block[item_data_offset : item_data_offset + item_data_size]
             
             # Process based on item type
@@ -1193,20 +1323,15 @@ class BtrfsParser:
                         # Corrupted inode data
                         continue
                     
-                    # Only store if we don't already have this inode, or new one looks better
+                    # Store ALL versions keyed by (objectid, generation)
+                    # This preserves deleted file inodes alongside current ones
                     if key.objectid not in self.inode_cache:
-                        self.inode_cache[key.objectid] = inode
-                    else:
-                        # Keep existing if new one has suspicious values
-                        existing = self.inode_cache[key.objectid]
-                        existing_type = (existing.mode >> 12) & 0xF
-                        # Prefer inode with valid regular file type (8) or directory (4)
-                        if file_type in (4, 8, 10) and existing_type not in (4, 8, 10):
-                            self.inode_cache[key.objectid] = inode
+                        self.inode_cache[key.objectid] = {}
+                    self.inode_cache[key.objectid][leaf_generation] = inode
                     
                     # Log found inodes for debugging
                     if inode.nlink == 0:
-                        self.logger.debug(f"Found potential deleted inode: {key.objectid} (size={inode.size}, nlink={inode.nlink})")
+                        self.logger.debug(f"Found potential deleted inode: {key.objectid} gen={leaf_generation} (size={inode.size}, nlink={inode.nlink})")
                 except Exception as e:
                     pass  # Skip malformed inode items
                     
@@ -1214,8 +1339,10 @@ class BtrfsParser:
                 try:
                     extent = self.parse_extent_data(item_data)
                     if key.objectid not in self.extent_cache:
-                        self.extent_cache[key.objectid] = []
-                    self.extent_cache[key.objectid].append(extent)
+                        self.extent_cache[key.objectid] = {}
+                    if leaf_generation not in self.extent_cache[key.objectid]:
+                        self.extent_cache[key.objectid][leaf_generation] = []
+                    self.extent_cache[key.objectid][leaf_generation].append(extent)
                 except Exception:
                     pass  # Skip malformed extent data items
                     
@@ -1322,23 +1449,57 @@ class BtrfsParser:
         
         return "/" + "/".join(path_parts) if path_parts else "/"
 
-    def recover_file(self, inode_num: int) -> Optional[RecoveredFile]:
+    def recover_file(self, inode_num: int, generation: Optional[int] = None) -> Optional[RecoveredFile]:
         """
         Recover a file by inode number using cached extents.
+        
+        Args:
+            inode_num: Inode number to recover
+            generation: Specific generation to use. If None, uses highest generation.
         """
         if inode_num not in self.inode_cache:
             return None
-            
-        inode = self.inode_cache[inode_num]
-        extents = self.extent_cache.get(inode_num, [])
+        
+        gen_map = self.inode_cache[inode_num]
+        if not gen_map:
+            return None
+        
+        # Select the specific generation or default to highest
+        if generation is not None and generation in gen_map:
+            inode = gen_map[generation]
+        else:
+            # Use the highest generation (most recent)
+            generation = max(gen_map.keys())
+            inode = gen_map[generation]
+        
+        # Get extents for this generation, falling back to best available
+        extents = []
+        ext_gen_map = self.extent_cache.get(inode_num, {})
+        if generation in ext_gen_map:
+            extents = ext_gen_map[generation]
+        elif ext_gen_map:
+            # Find the closest generation that has extents
+            available_gens = sorted(ext_gen_map.keys())
+            # Prefer the closest generation <= target, else closest >
+            best_gen = None
+            for g in reversed(available_gens):
+                if g <= generation:
+                    best_gen = g
+                    break
+            if best_gen is None:
+                best_gen = available_gens[0]
+            extents = ext_gen_map[best_gen]
         
         # Sort extents by offset
-        extents.sort(key=lambda x: x.offset)
+        extents = sorted(extents, key=lambda x: x.offset)
         
         # Determine if deleted (heuristic)
         # - nlink == 0 means no directory entries point to it
         # - Presence in orphan_inodes means it was marked for deletion
-        is_deleted = (inode.nlink == 0) or (inode_num in self.orphan_inodes)
+        # - If this is NOT the highest generation for this inode, it's an older version
+        highest_gen = max(gen_map.keys())
+        is_older_version = (generation < highest_gen)
+        is_deleted = (inode.nlink == 0) or (inode_num in self.orphan_inodes) or is_older_version
         
         # Get filename from caches
         name = self.name_cache.get(inode_num, f"file_{inode_num}")
@@ -1363,6 +1524,7 @@ class BtrfsParser:
         # Add path as extra attribute (optional field not in dataclass)
         recovered.path = full_path
         recovered.is_orphan = inode_num in self.orphan_inodes
+        recovered.generation = generation
         
         return recovered
     
@@ -1403,103 +1565,119 @@ class BtrfsParser:
                 raise ValueError("Not a valid Btrfs filesystem")
             
             self.parse_superblock()
-            # Scan if not already scanned
-            if not self.inode_cache:
-                self.scan_deleted_inodes()
+            # ALWAYS do a fresh scan — scan_deleted_inodes() clears caches internally
+            self.logger.info("Starting fresh device scan...")
+            self.scan_deleted_inodes()
             
             count = 0
             skipped_by_filter = 0
             skipped_not_regular = 0
             total_checked = 0
             
-            for inode_num in self.inode_cache:
-                total_checked += 1
-                # filter for likely interesting files (e.g. size > 0, regular files)
-                inode = self.inode_cache[inode_num]
-                
-                # Regular file type 8 (0100000)
-                file_type_bits = (inode.mode >> 12) & 0xF
-                if file_type_bits != 8:  # 8 = regular file, 4 = directory, etc.
-                    skipped_not_regular += 1
+            for inode_num, gen_map in self.inode_cache.items():
+                if not gen_map:
                     continue
                 
-                # Determine if file is deleted (nlink == 0 means no directory entries point to it)
-                is_deleted = (inode.nlink == 0) or (inode_num in self.orphan_inodes)
-                file_status = "deleted" if is_deleted else "active"
+                # Find the highest generation (current/active version)
+                highest_gen = max(gen_map.keys())
                 
-                # Apply filter
-                if file_filter == "deleted_only" and not is_deleted:
-                    skipped_by_filter += 1
-                    continue
-                elif file_filter == "active_only" and is_deleted:
-                    skipped_by_filter += 1
-                    continue
+                # Iterate ALL generations for this inode to find deleted versions
+                for generation, inode in gen_map.items():
+                    total_checked += 1
                     
-                file_info = self.recover_file(inode_num)
-                if file_info:
-                    # Write file data
-                    safe_name = "".join(c for c in file_info.name if c.isalnum() or c in ('._-')).strip()
-                    if not safe_name:
-                        safe_name = f"file_{inode_num}"
+                    # Regular file type 8 (0100000)
+                    file_type_bits = (inode.mode >> 12) & 0xF
+                    if file_type_bits != 8:  # 8 = regular file, 4 = directory, etc.
+                        skipped_not_regular += 1
+                        continue
                     
-                    # Add status prefix to filename for clarity
-                    if is_deleted:
-                        prefixed_name = f"DELETED_{safe_name}"
-                    else:
-                        prefixed_name = f"ACTIVE_{safe_name}"
+                    # Skip zero-size files (nothing to recover)
+                    if inode.size == 0:
+                        skipped_not_regular += 1
+                        continue
                     
-                    # Handle duplicates
-                    target_file = out_path / prefixed_name
-                    counter = 1
-                    while target_file.exists():
-                        target_file = out_path / f"{prefixed_name}_{counter}"
-                        counter += 1
+                    # Determine if file is deleted:
+                    # - nlink == 0: explicitly unlinked
+                    # - In orphan_inodes: marked for deletion by Btrfs
+                    # - Older generation: superseded by a newer version (COW overwrote it)
+                    is_older_version = (generation < highest_gen)
+                    is_deleted = (inode.nlink == 0) or (inode_num in self.orphan_inodes) or is_older_version
+                    file_status = "deleted" if is_deleted else "active"
+                    
+                    # Apply filter
+                    if file_filter == "deleted_only" and not is_deleted:
+                        skipped_by_filter += 1
+                        continue
+                    elif file_filter == "active_only" and is_deleted:
+                        skipped_by_filter += 1
+                        continue
                         
-                    try:
-                        # Write file and get data for verification
-                        file_data = self.write_file_data(file_info, target_file)
+                    file_info = self.recover_file(inode_num, generation)
+                    if file_info:
+                        # Write file data
+                        safe_name = "".join(c for c in file_info.name if c.isalnum() or c in ('._-')).strip()
+                        if not safe_name:
+                            safe_name = f"file_{inode_num}"
                         
-                        # Compute SHA256 hash of recovered data
-                        file_hash = ""
-                        if file_data and len(file_data) > 0:
-                            file_hash = hashlib.sha256(file_data).hexdigest()
-                        
-                        # Verify integrity using Btrfs checksums
-                        integrity_status = "unverified"
-                        integrity_details = ""
-                        
-                        if file_data and len(file_data) > 0:
-                            integrity_status, integrity_details = self.verify_file_integrity(file_info, file_data)
+                        # Add status prefix and generation to filename for clarity
+                        if is_deleted:
+                            prefixed_name = f"DELETED_{safe_name}_gen{generation}"
                         else:
-                            integrity_status = "no_checksum"
-                            integrity_details = "Empty file or no data recovered"
+                            prefixed_name = f"ACTIVE_{safe_name}"
                         
-                        recovered_files.append({
-                            'name': target_file.name,
-                            'original_name': safe_name,
-                            'inode': file_info.inode,
-                            'size': file_info.size,
-                            'type': self._get_file_type(file_info.mode),
-                            'mode': oct(file_info.mode),
-                            'uid': file_info.uid,
-                            'gid': file_info.gid,
-                            'modified': file_info.mtime.strftime('%Y-%m-%d %H:%M:%S'),
-                            'accessed': file_info.atime.strftime('%Y-%m-%d %H:%M:%S'),
-                            'changed': file_info.ctime.strftime('%Y-%m-%d %H:%M:%S'),
-                            'hash': file_hash,
-                            'status': file_status,  # 'deleted' or 'active'
-                            'deleted': is_deleted,  # kept for backward compatibility
-                            'nlink': inode.nlink,
-                            'extents': len(file_info.data_extents),
-                            'path': str(target_file),
-                            # Integrity verification fields
-                            'integrity_status': integrity_status,  # 'verified', 'corrupted', 'unverified', 'no_checksum'
-                            'integrity_verified': integrity_status == 'verified',
-                            'integrity_details': integrity_details
-                        })
-                        count += 1
-                    except Exception as e:
-                        self.logger.error(f"Failed to write file {inode_num}: {e}")
+                        # Handle duplicates
+                        target_file = out_path / prefixed_name
+                        counter = 1
+                        while target_file.exists():
+                            target_file = out_path / f"{prefixed_name}_{counter}"
+                            counter += 1
+                            
+                        try:
+                            # Write file and get data for verification
+                            file_data = self.write_file_data(file_info, target_file)
+                            
+                            # Compute SHA256 hash of recovered data
+                            file_hash = ""
+                            if file_data and len(file_data) > 0:
+                                file_hash = hashlib.sha256(file_data).hexdigest()
+                            
+                            # Verify integrity using Btrfs checksums
+                            integrity_status = "unverified"
+                            integrity_details = ""
+                            
+                            if file_data and len(file_data) > 0:
+                                integrity_status, integrity_details = self.verify_file_integrity(file_info, file_data)
+                            else:
+                                integrity_status = "no_checksum"
+                                integrity_details = "Empty file or no data recovered"
+                            
+                            recovered_files.append({
+                                'name': target_file.name,
+                                'original_name': safe_name,
+                                'inode': file_info.inode,
+                                'size': file_info.size,
+                                'type': self._get_file_type(file_info.mode),
+                                'mode': oct(file_info.mode),
+                                'uid': file_info.uid,
+                                'gid': file_info.gid,
+                                'modified': file_info.mtime.strftime('%Y-%m-%d %H:%M:%S'),
+                                'accessed': file_info.atime.strftime('%Y-%m-%d %H:%M:%S'),
+                                'changed': file_info.ctime.strftime('%Y-%m-%d %H:%M:%S'),
+                                'hash': file_hash,
+                                'status': file_status,  # 'deleted' or 'active'
+                                'deleted': is_deleted,  # kept for backward compatibility
+                                'nlink': inode.nlink,
+                                'generation': generation,
+                                'extents': len(file_info.data_extents),
+                                'path': str(target_file),
+                                # Integrity verification fields
+                                'integrity_status': integrity_status,  # 'verified', 'corrupted', 'unverified', 'no_checksum'
+                                'integrity_verified': integrity_status == 'verified',
+                                'integrity_details': integrity_details
+                            })
+                            count += 1
+                        except Exception as e:
+                            self.logger.error(f"Failed to write file {inode_num} gen={generation}: {e}")
 
             # Log verification statistics
             self.logger.info(f"Recovery complete: {count} files recovered to {output_dir}")
