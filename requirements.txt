@@ -56,6 +56,15 @@ openpyxl>=3.1.0
 crc32c>=2.3
 
 # ==========================================
+# OPTIONAL - Btrfs Compression Support
+# ==========================================
+# ZLIB is built-in (no extra install needed)
+# LZO decompression for Btrfs compressed extents
+python-lzo>=1.14
+# ZSTD decompression for Btrfs compressed extents
+zstandard>=0.21.0
+
+# ==========================================
 # TESTING (Optional - Development)
 # ==========================================
 # Uncomment for development/testing

@@ -22,6 +22,7 @@ from typing import List, Dict, Optional, Tuple, Set
 from datetime import datetime
 from dataclasses import dataclass, field
 import hashlib
+import zlib
 
 # Try to import hardware-accelerated CRC32C
 try:
@@ -31,6 +32,22 @@ except ImportError:
     HAS_CRC32C = False
     # Fallback to pure Python implementation
     import binascii
+
+# Compression libraries
+# ZLIB: built-in (imported above)
+# LZO: optional — pip install python-lzo
+try:
+    import lzo
+    HAS_LZO = True
+except ImportError:
+    HAS_LZO = False
+
+# ZSTD: optional — pip install zstandard
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    HAS_ZSTD = False
 
 
 # Btrfs Constants
@@ -1532,9 +1549,98 @@ class BtrfsParser:
         # This happens for System Chunk Array items in superblock sometimes
         return logical
 
+    def _decompress_extent(self, compressed_data: bytes, compression: int,
+                           expected_size: int) -> bytes:
+        """
+        Decompress extent data based on the compression algorithm.
+        
+        Args:
+            compressed_data: The raw compressed bytes read from disk
+            compression: Compression type (BTRFS_COMPRESS_ZLIB/LZO/ZSTD)
+            expected_size: Expected decompressed size (ram_bytes)
+            
+        Returns:
+            Decompressed bytes, or the original data if decompression fails
+        """
+        if compression == BTRFS_COMPRESS_NONE:
+            return compressed_data
+        
+        try:
+            if compression == BTRFS_COMPRESS_ZLIB:
+                return zlib.decompress(compressed_data)
+            
+            elif compression == BTRFS_COMPRESS_LZO:
+                if not HAS_LZO:
+                    self.logger.warning(
+                        "LZO compressed extent found but python-lzo not installed. "
+                        "Install with: pip install python-lzo")
+                    return compressed_data
+                
+                # Btrfs LZO format: 4-byte LE total compressed length,
+                # then segments each prefixed with a 4-byte LE compressed segment length.
+                # Each segment decompresses to at most 4096 bytes (one page).
+                if len(compressed_data) < 4:
+                    return compressed_data
+                
+                total_len = struct.unpack('<I', compressed_data[:4])[0]
+                pos = 4
+                output = bytearray()
+                
+                while pos < min(total_len + 4, len(compressed_data)) and len(output) < expected_size:
+                    if pos + 4 > len(compressed_data):
+                        break
+                    seg_len = struct.unpack('<I', compressed_data[pos:pos+4])[0]
+                    pos += 4
+                    
+                    if seg_len == 0 or pos + seg_len > len(compressed_data):
+                        break
+                    
+                    seg_data = compressed_data[pos:pos + seg_len]
+                    pos += seg_len
+                    
+                    try:
+                        decompressed_seg = lzo.decompress(seg_data, False, 4096)
+                        output.extend(decompressed_seg)
+                    except Exception as e:
+                        self.logger.debug(f"LZO segment decompression failed: {e}")
+                        # Try alternative: some implementations use header
+                        try:
+                            decompressed_seg = lzo.decompress(
+                                b'\xf0' + struct.pack('>I', min(4096, expected_size - len(output))) + seg_data,
+                                True, 4096
+                            )
+                            output.extend(decompressed_seg)
+                        except Exception:
+                            break
+                
+                return bytes(output[:expected_size])
+            
+            elif compression == BTRFS_COMPRESS_ZSTD:
+                if not HAS_ZSTD:
+                    self.logger.warning(
+                        "ZSTD compressed extent found but zstandard not installed. "
+                        "Install with: pip install zstandard")
+                    return compressed_data
+                
+                dctx = zstd.ZstdDecompressor()
+                return dctx.decompress(compressed_data, max_output_size=expected_size)
+            
+            else:
+                self.logger.warning(f"Unknown compression type {compression}")
+                return compressed_data
+                
+        except Exception as e:
+            self.logger.error(
+                f"Decompression failed (type={compression}, "
+                f"compressed_size={len(compressed_data)}, "
+                f"expected_size={expected_size}): {e}")
+            return compressed_data
+    
     def write_file_data(self, file_info: RecoveredFile, target_path: Path) -> bytes:
         """
-        Write recovered data to target path.
+        Write recovered data to target path, handling compressed extents.
+        
+        Supports decompression of ZLIB, LZO, and ZSTD compressed extents.
         
         Returns:
             The written data bytes (for verification purposes)
@@ -1542,8 +1648,6 @@ class BtrfsParser:
         all_data = bytearray()
         
         with open(target_path, 'wb') as f:
-            # If no extents but size > 0, we can't recover data (maybe inline missed?)
-            # Actually inline data is in extents too with type 0
             if not file_info.data_extents and file_info.size > 0:
                 self.logger.warning(f"File {file_info.inode} has size {file_info.size} but no extents.")
                 return bytes()
@@ -1560,34 +1664,79 @@ class BtrfsParser:
                 # Inline data (type 0)
                 if extent.type == BTRFS_FILE_EXTENT_INLINE:
                     if extent.inline_data:
-                         # Handle compression if needed (todo)
-                         # For now assume uncompressed or raw write
-                         f.write(extent.inline_data)
-                         all_data.extend(extent.inline_data)
-                         current_pos += len(extent.inline_data)
-                    pass
+                        data = extent.inline_data
+                        
+                        # Decompress inline data if compressed
+                        if extent.compression != BTRFS_COMPRESS_NONE:
+                            self.logger.debug(
+                                f"Decompressing inline extent: compression={extent.compression}, "
+                                f"compressed_size={len(data)}, ram_bytes={extent.ram_bytes}")
+                            data = self._decompress_extent(
+                                data, extent.compression, extent.ram_bytes
+                            )
+                        
+                        f.write(data)
+                        all_data.extend(data)
+                        current_pos += len(data)
                     
                 # Regular data
                 elif extent.disk_bytenr > 0:
-                    read_len = extent.num_bytes
-                    # Clip if exceeds file size
-                    if current_pos + read_len > file_info.size:
-                        read_len = file_info.size - current_pos
-                    
                     try:
                         # Map logical to physical
                         physical_addr = self.map_logical_to_physical(extent.disk_bytenr)
                         
-                        self.file_handle.seek(self.offset + physical_addr)
-                        data = self.file_handle.read(read_len)
-                        f.write(data)
-                        all_data.extend(data)
-                        current_pos += len(data)
+                        if extent.compression != BTRFS_COMPRESS_NONE:
+                            # Read the full compressed extent from disk
+                            # disk_num_bytes = compressed size on disk
+                            # num_bytes = decompressed size we need
+                            read_len = extent.disk_num_bytes
+                            self.file_handle.seek(self.offset + physical_addr)
+                            compressed_data = self.file_handle.read(read_len)
+                            
+                            self.logger.debug(
+                                f"Decompressing regular extent: compression={extent.compression}, "
+                                f"disk_num_bytes={extent.disk_num_bytes}, "
+                                f"num_bytes={extent.num_bytes}, ram_bytes={extent.ram_bytes}")
+                            
+                            decompressed = self._decompress_extent(
+                                compressed_data, extent.compression, extent.ram_bytes
+                            )
+                            
+                            # Apply extent offset and num_bytes to get the slice we need
+                            # extent.offset = offset within the decompressed extent
+                            # extent.num_bytes = how many bytes to take from that offset
+                            start = extent.offset
+                            end = start + extent.num_bytes
+                            data = decompressed[start:end]
+                            
+                            # Clip if exceeds file size
+                            remaining = file_info.size - current_pos
+                            if len(data) > remaining:
+                                data = data[:remaining]
+                            
+                            f.write(data)
+                            all_data.extend(data)
+                            current_pos += len(data)
+                        else:
+                            # Uncompressed: read num_bytes directly
+                            read_len = extent.num_bytes
+                            if current_pos + read_len > file_info.size:
+                                read_len = file_info.size - current_pos
+                            
+                            self.file_handle.seek(self.offset + physical_addr + extent.offset)
+                            data = self.file_handle.read(read_len)
+                            f.write(data)
+                            all_data.extend(data)
+                            current_pos += len(data)
                     except Exception as e:
                         self.logger.error(f"Error reading extent at {extent.disk_bytenr}: {e}")
                 else:
-                    # Sparse/Prealloc?
-                    pass
+                    # Sparse/Prealloc: write zeros
+                    if extent.num_bytes > 0:
+                        zeros = b'\x00' * extent.num_bytes
+                        f.write(zeros)
+                        all_data.extend(zeros)
+                        current_pos += extent.num_bytes
             
             # Truncate to correct size
             if f.tell() > file_info.size:
