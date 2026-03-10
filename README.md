@@ -136,8 +136,6 @@ python run.py
 
 ### Btrfs (B-Tree File System)
 
-**Support Level:** Full
-
 **Capabilities:**
 - Superblock and tree root parsing
 - COW (Copy-On-Write) tree traversal
@@ -154,8 +152,6 @@ python run.py
 **Recovery Approach:** File carving (primary), metadata parsing (secondary)
 
 ### XFS (Extended File System)
-
-**Support Level:** Planned
 
 **Capabilities:**
 - Superblock parsing
@@ -180,7 +176,7 @@ umount /mnt/test
 
 ### Legal Disclaimer
 
-**IMPORTANT:** This tool is designed for **legitimate forensic investigations** only.
+**IMPORTANT:** This tool is designed for **legitimate forensic investigations** and **educational purposes** only.
 
 **Authorized Uses:**
 - Law enforcement investigations (with proper warrant)
@@ -204,14 +200,6 @@ umount /mnt/test
 4. **Documentation**: Keep detailed logs of all actions
 5. **Integrity**: Never modify original evidence
 6. **Transparency**: Clearly document methodology in reports
-
-### Compliance
-
-Unearth is designed to comply with:
-- **ACPO Guidelines** (UK)
-- **NIJ Guidelines** (USA)
-- **ISO/IEC 27037:2012** (Digital Evidence)
-- **GDPR** (Data Protection)
 
 ### Liability
 
@@ -264,4 +252,4 @@ We've built this tool with a passion for digital forensics and a commitment to t
 
 *Made with ❤️ by the Unearth Development Team*
 
-*Last Updated: February 2026*
+*Last Updated: March 2026*

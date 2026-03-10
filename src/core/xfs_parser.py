@@ -63,6 +63,15 @@ XFS_DINODE_CORE_V3_SIZE = 176
 XFS_BMAP_MAGIC = 0x424D4150       # 'BMAP' short format
 XFS_BMAP_CRC_MAGIC = 0x424D4133   # 'BMA3' long format (v5)
 
+# AGF free-space B+tree magic numbers
+XFS_ABTB_MAGIC = 0x41425442       # 'ABTB' — bnobt v4
+XFS_ABTB_CRC_MAGIC = 0x41423342   # 'AB3B' — bnobt v5
+
+# AGI unlinked buckets
+XFS_AGI_UNLINKED_BUCKETS = 64
+XFS_AGI_UNLINKED_OFFSET = 72      # Byte offset in AGI header where buckets start
+NULLAGINO = 0xFFFFFFFF            # Sentinel for empty unlinked bucket
+
 # AG header sizes
 XFS_AGF_SIZE = 224
 XFS_AGI_SIZE = 336
@@ -113,6 +122,8 @@ class XfsAgfHeader:
     length: int           # AG length in blocks
     freeblks: int         # Free blocks in AG
     longest: int          # Longest free extent
+    bno_root: int = 0     # Block-number-ordered free-space B+tree root
+    bno_level: int = 0    # bnobt tree levels
 
 
 @dataclass
@@ -222,6 +233,19 @@ class XfsParser:
         self.extent_cache: Dict[int, List[XfsExtent]] = {}
         self.name_cache: Dict[int, str] = {}
         self.dir_entries: Dict[int, List[Tuple[int, str]]] = {}  # parent_ino -> [(child_ino, name)]
+
+        # Free-space block ranges for overlap/reallocation detection
+        # Each entry is (abs_start_block, block_count)
+        self.free_block_ranges: List[Tuple[int, int]] = []
+        self._free_block_set: Optional[set] = None  # Lazily built set of free block numbers
+
+        # Fragmented recovery statistics
+        self.fragmented_recovery_stats = {
+            'unlinked_inodes_found': 0,
+            'salvaged_extent_inodes': 0,
+            'extents_in_free_space': 0,
+            'extents_possibly_overwritten': 0,
+        }
 
         # Verification statistics
         self.verification_stats = {
@@ -463,8 +487,10 @@ class XfsParser:
         versionnum = struct.unpack('>I', data[4:8])[0]
         seqno = struct.unpack('>I', data[8:12])[0]
         length = struct.unpack('>I', data[12:16])[0]
-        # bno_root(4), cnt_root(4), spare(4)
-        # bno_level(4), cnt_level(4)
+        bno_root = struct.unpack('>I', data[16:20])[0]
+        # cnt_root at 20, spare at 24
+        bno_level = struct.unpack('>I', data[28:32])[0]
+        # cnt_level at 32
         freeblks = struct.unpack('>I', data[36:40])[0]
         longest = struct.unpack('>I', data[40:44])[0]
 
@@ -475,6 +501,8 @@ class XfsParser:
             length=length,
             freeblks=freeblks,
             longest=longest,
+            bno_root=bno_root,
+            bno_level=bno_level,
         )
 
     def _parse_agi(self, abs_offset: int) -> XfsAgiHeader:
@@ -984,6 +1012,16 @@ class XfsParser:
                             if exts:
                                 self.extent_cache[abs_ino] = exts
 
+                        # Speculative extent salvage for deleted inodes
+                        # whose extent count was zeroed but data fork
+                        # may still contain valid extent records
+                        if abs_ino not in self.extent_cache:
+                            salvaged = self._try_salvage_extents_for_inode(
+                                raw_inode, core
+                            )
+                            if salvaged:
+                                self.extent_cache[abs_ino] = salvaged
+
                         # Parse directories for filename recovery
                         if (core.di_mode & S_IFMT) == S_IFDIR and core.di_size > 0:
                             if core.di_format == XFS_DINODE_FMT_LOCAL:
@@ -1079,6 +1117,481 @@ class XfsParser:
 
 
         return chunks
+
+    # --------------------------------------------------------
+    # Fragmented Recovery: AGF Free-Space Scanning
+    # --------------------------------------------------------
+
+    def _build_free_block_set(self):
+        """
+        Walk the AGF free-space B+tree (bnobt) for every AG and collect
+        all free block ranges. Builds a set of individual free block
+        numbers for O(1) lookups during extent integrity checks.
+        """
+        if not self.ag_headers:
+            self.parse_ag_headers()
+
+        sb = self.superblock
+        self.free_block_ranges = []
+
+        for ag_num in range(sb.agcount):
+            agf, _ = self.ag_headers[ag_num]
+            if agf.bno_root == 0:
+                continue
+
+            try:
+                ranges = self._walk_agf_bnobt(ag_num, agf.bno_root, agf.bno_level)
+                # Convert AG-relative block numbers to absolute block numbers
+                for ag_block, count in ranges:
+                    abs_block = ag_num * sb.agblocks + ag_block
+                    self.free_block_ranges.append((abs_block, count))
+            except Exception as e:
+                self.logger.debug(f"AG {ag_num}: failed to walk bnobt: {e}")
+
+        # Build a set of individual block numbers for fast lookup
+        # Only build for reasonably sized free-space maps to avoid memory explosion
+        total_free_blocks = sum(count for _, count in self.free_block_ranges)
+        if total_free_blocks < 10_000_000:  # <10M blocks (~40GB at 4K blocks)
+            self._free_block_set = set()
+            for start, count in self.free_block_ranges:
+                for b in range(start, start + count):
+                    self._free_block_set.add(b)
+        else:
+            # For very large images, use range-based lookup instead
+            self._free_block_set = None
+
+        self.logger.info(
+            f"Free-space scan: {len(self.free_block_ranges)} free ranges, "
+            f"{total_free_blocks} total free blocks"
+        )
+
+    def _walk_agf_bnobt(self, ag_num: int, root_block: int, level: int,
+                        depth: int = 0) -> List[Tuple[int, int]]:
+        """
+        Walk the AGF block-number-ordered free-space B+tree (bnobt).
+
+        Returns:
+            List of (ag_relative_block, block_count) free ranges
+        """
+        ranges = []
+        sb = self.superblock
+
+        if depth > 10:
+            self.logger.warning(f"AG {ag_num}: bnobt recursion depth exceeded")
+            return ranges
+
+        try:
+            abs_offset = self._ag_block_to_abs(ag_num, root_block)
+            self.file_handle.seek(abs_offset)
+            block_data = self.file_handle.read(sb.blocksize)
+        except (OSError, IOError) as e:
+            self.logger.debug(f"AG {ag_num}: failed to read bnobt block {root_block}: {e}")
+            return ranges
+
+        if len(block_data) < 16:
+            return ranges
+
+        magic = struct.unpack('>I', block_data[0:4])[0]
+
+        # Determine header size based on magic
+        if magic == XFS_ABTB_CRC_MAGIC:
+            header_size = 56  # v5 long format
+        elif magic == XFS_ABTB_MAGIC:
+            header_size = 16  # v4 short format
+        else:
+            self.logger.debug(
+                f"AG {ag_num}: unexpected bnobt magic 0x{magic:08X} at block {root_block}"
+            )
+            return ranges
+
+        bb_level = struct.unpack('>H', block_data[4:6])[0]
+        bb_numrecs = struct.unpack('>H', block_data[6:8])[0]
+
+        if bb_level == 0:
+            # Leaf node — records are (startblock:4, blockcount:4) pairs
+            for i in range(bb_numrecs):
+                off = header_size + i * 8
+                if off + 8 > len(block_data):
+                    break
+                start_block = struct.unpack('>I', block_data[off:off+4])[0]
+                block_count = struct.unpack('>I', block_data[off+4:off+8])[0]
+                if block_count > 0:
+                    ranges.append((start_block, block_count))
+        else:
+            # Internal node — keys (4 bytes each) then pointers (4 bytes each)
+            keys_start = header_size
+            ptrs_start = keys_start + bb_numrecs * 4
+
+            for i in range(bb_numrecs):
+                ptr_off = ptrs_start + i * 4
+                if ptr_off + 4 > len(block_data):
+                    break
+                child_block = struct.unpack('>I', block_data[ptr_off:ptr_off+4])[0]
+                child_ranges = self._walk_agf_bnobt(ag_num, child_block, bb_level - 1, depth + 1)
+                ranges.extend(child_ranges)
+
+        return ranges
+
+    def _is_block_free(self, abs_block: int) -> bool:
+        """Check if a single absolute block number is in the free-space set."""
+        if self._free_block_set is not None:
+            return abs_block in self._free_block_set
+
+        # Fallback: range-based binary search
+        for start, count in self.free_block_ranges:
+            if start <= abs_block < start + count:
+                return True
+        return False
+
+    def _is_extent_likely_intact(self, extent: XfsExtent) -> bool:
+        """
+        Check if an extent's blocks are currently free (good for recovery)
+        or in-use by another file (possibly overwritten).
+
+        Returns True if the extent is in free space (likely intact).
+        Returns False if it appears to be in-use (possibly overwritten).
+        """
+        # Check the first and last block of the extent
+        first_free = self._is_block_free(extent.startblock)
+        last_block = extent.startblock + extent.blockcount - 1
+        last_free = self._is_block_free(last_block)
+
+        if first_free and last_free:
+            self.fragmented_recovery_stats['extents_in_free_space'] += 1
+            return True
+        else:
+            self.fragmented_recovery_stats['extents_possibly_overwritten'] += 1
+            return False
+
+    # --------------------------------------------------------
+    # Fragmented Recovery: AGI Unlinked Inode List
+    # --------------------------------------------------------
+
+    def _scan_unlinked_inodes(self):
+        """
+        Scan the AGI unlinked inode hash table for recently-deleted inodes.
+
+        XFS maintains 64 hash buckets in the AGI header (starting at offset 72).
+        Each bucket is the head of a linked list of unlinked inodes. The chain
+        is formed via di_next_unlinked at byte offset 16 in each inode's core.
+        These inodes are between unlink() and the final inode free, so they
+        often still have valid extent data.
+        """
+        if not self.ag_headers:
+            self.parse_ag_headers()
+
+        sb = self.superblock
+        unlinked_found = 0
+
+        for ag_num in range(sb.agcount):
+            _, agi = self.ag_headers[ag_num]
+            ag_offset = self.offset + ag_num * sb.agblocks * sb.blocksize
+
+            # Read the unlinked hash buckets from the AGI
+            try:
+                agi_offset = ag_offset + 2 * sb.sectsize
+                self.file_handle.seek(agi_offset + XFS_AGI_UNLINKED_OFFSET)
+                bucket_data = self.file_handle.read(XFS_AGI_UNLINKED_BUCKETS * 4)
+
+                if len(bucket_data) < XFS_AGI_UNLINKED_BUCKETS * 4:
+                    continue
+            except (OSError, IOError):
+                continue
+
+            inodes_per_ag = sb.agblocks * sb.inopblock
+
+            for bucket_idx in range(XFS_AGI_UNLINKED_BUCKETS):
+                head_ino = struct.unpack('>I',
+                    bucket_data[bucket_idx*4:(bucket_idx+1)*4])[0]
+
+                if head_ino == NULLAGINO or head_ino == 0:
+                    continue
+
+                # Follow the unlinked chain
+                current_ag_ino = head_ino
+                visited = set()
+                chain_depth = 0
+
+                while (current_ag_ino != NULLAGINO and current_ag_ino != 0
+                       and current_ag_ino not in visited and chain_depth < 1000):
+                    visited.add(current_ag_ino)
+                    chain_depth += 1
+
+                    abs_ino = ag_num * inodes_per_ag + current_ag_ino
+
+                    # Skip if already in cache
+                    if abs_ino not in self.inode_cache:
+                        try:
+                            abs_offset = self._inode_abs_offset(abs_ino)
+                            if abs_offset < 0:
+                                break
+
+                            self.file_handle.seek(abs_offset)
+                            raw_inode = self.file_handle.read(sb.inodesize)
+                            if len(raw_inode) < sb.inodesize:
+                                break
+
+                            core = self._parse_inode_core(raw_inode, 0)
+                            if core is not None:
+                                self.inode_cache[abs_ino] = core
+
+                                # Read extents
+                                if core.di_nextents > 0 or core.di_format in (
+                                    XFS_DINODE_FMT_EXTENTS, XFS_DINODE_FMT_BTREE
+                                ):
+                                    exts = self._read_extents_from_inode(raw_inode, core)
+                                    if exts:
+                                        self.extent_cache[abs_ino] = exts
+
+                                # Try speculative salvage if no extents found
+                                if abs_ino not in self.extent_cache:
+                                    salvaged = self._try_salvage_extents_for_inode(
+                                        raw_inode, core
+                                    )
+                                    if salvaged:
+                                        self.extent_cache[abs_ino] = salvaged
+
+                                unlinked_found += 1
+                                self.logger.debug(
+                                    f"Unlinked inode {abs_ino} in AG {ag_num} "
+                                    f"bucket {bucket_idx}: nblocks={core.di_nblocks}"
+                                )
+                        except Exception as e:
+                            self.logger.debug(
+                                f"Error reading unlinked inode {abs_ino}: {e}"
+                            )
+                            break
+
+                    # Follow chain: di_next_unlinked is at offset 16 in inode core
+                    try:
+                        abs_offset = self._inode_abs_offset(abs_ino)
+                        self.file_handle.seek(abs_offset + 16)
+                        next_data = self.file_handle.read(4)
+                        if len(next_data) < 4:
+                            break
+                        current_ag_ino = struct.unpack('>I', next_data)[0]
+                    except Exception:
+                        break
+
+        self.fragmented_recovery_stats['unlinked_inodes_found'] = unlinked_found
+        self.logger.info(
+            f"Unlinked inode scan: found {unlinked_found} inodes in AGI unlinked lists"
+        )
+
+    # --------------------------------------------------------
+    # Fragmented Recovery: Speculative Extent Salvage
+    # --------------------------------------------------------
+
+    def _try_salvage_extents_for_inode(self, inode_data: bytes,
+                                       inode_core: XfsInodeCore) -> List[XfsExtent]:
+        """
+        Attempt to salvage extent records from a deleted inode whose
+        di_nextents has been zeroed but whose data fork bytes may still
+        contain valid 128-bit extent records.
+
+        This is the speculative recovery path for heavily-cleared inodes.
+        Only activated for inodes that appear deleted but have no extents
+        from the normal parsing path.
+
+        Args:
+            inode_data: Complete raw inode data
+            inode_core: Parsed inode core
+
+        Returns:
+            List of plausible extent records, or empty list
+        """
+        # Only attempt on likely-deleted inodes with block count but no extents
+        if inode_core.di_nextents > 0:
+            return []  # Normal path should have handled this
+
+        if inode_core.di_nblocks == 0:
+            return []  # No data to recover
+
+        # Determine data fork boundaries
+        if inode_core.di_version == 3:
+            data_fork_offset = XFS_DINODE_CORE_V3_SIZE
+        else:
+            data_fork_offset = XFS_DINODE_CORE_V2_SIZE
+
+        if inode_core.di_forkoff > 0:
+            data_fork_size = inode_core.di_forkoff * 8
+        else:
+            data_fork_size = len(inode_data) - data_fork_offset
+
+        # Quick check: is the data fork all zeros?
+        fork_bytes = inode_data[data_fork_offset:data_fork_offset + data_fork_size]
+        if fork_bytes == b'\x00' * len(fork_bytes):
+            return []  # Completely zeroed — nothing to salvage
+
+        salvaged = self._try_salvage_extents(inode_data, data_fork_offset, data_fork_size)
+
+        if salvaged:
+            self.fragmented_recovery_stats['salvaged_extent_inodes'] += 1
+            self.logger.info(
+                f"Salvaged {len(salvaged)} extents from zeroed-count inode "
+                f"(nblocks={inode_core.di_nblocks})"
+            )
+
+        return salvaged
+
+    def _try_salvage_extents(self, inode_data: bytes, fork_offset: int,
+                             fork_size: int) -> List[XfsExtent]:
+        """
+        Speculatively parse 16-byte extent records from a data fork whose
+        extent count was zeroed by deletion.
+
+        Applies strict sanity checks to avoid false positives:
+        - startblock must be > 0 and within filesystem bounds
+        - blockcount must be > 0 and < 2^21 (XFS max)
+        - startoff must have reasonable logical offset
+        - No duplicate or overlapping extents
+        """
+        extents = []
+        sb = self.superblock
+        if not sb:
+            return extents
+
+        max_blocks = sb.dblocks  # Total filesystem blocks
+        max_extent_blocks = (1 << 21) - 1  # 2,097,151 blocks
+
+        max_extents = fork_size // 16
+        seen_blocks = set()
+
+        for i in range(max_extents):
+            off = fork_offset + i * 16
+            if off + 16 > len(inode_data):
+                break
+
+            try:
+                ext = self._decode_extent(inode_data, off)
+            except Exception:
+                continue
+
+            # Strict validation
+            if ext.blockcount == 0 or ext.startblock == 0:
+                continue
+            if ext.blockcount > max_extent_blocks:
+                continue
+            if ext.startblock >= max_blocks:
+                continue
+            if ext.startoff > 1_000_000_000:  # Unreasonable logical offset
+                continue
+
+            # Check for overlapping block ranges
+            block_range = range(ext.startblock, ext.startblock + ext.blockcount)
+            if any(b in seen_blocks for b in [block_range.start, block_range.stop - 1]):
+                continue
+
+            seen_blocks.add(block_range.start)
+            seen_blocks.add(block_range.stop - 1)
+            extents.append(ext)
+
+        return extents
+
+    # --------------------------------------------------------
+    # Fragmented Recovery: Confidence Scoring
+    # --------------------------------------------------------
+
+    def _compute_recovery_confidence(self, inode_num: int,
+                                      file_data: bytes) -> Tuple[float, str]:
+        """
+        Evaluate the quality/confidence of a recovered file.
+
+        Scoring factors:
+        - Extent free-space status: are the data blocks still free (not reallocated)?
+        - Extent contiguity: are logical offsets contiguous or heavily gapped?
+        - File structure: did _detect_true_file_size find a valid structure?
+        - Data entropy: does the data look like a real file (not all zeros)?
+
+        Returns:
+            (confidence: float 0.0-1.0, detail_string: str)
+        """
+        details = []
+        scores = []
+
+        extents = self.extent_cache.get(inode_num, [])
+
+        # 1. Free-space check (weight: 40%)
+        if extents and self.free_block_ranges:
+            intact_count = 0
+            total_count = len(extents)
+            for ext in extents:
+                if self._is_extent_likely_intact(ext):
+                    intact_count += 1
+
+            free_ratio = intact_count / total_count if total_count > 0 else 0
+            scores.append(('free_space', free_ratio, 0.40))
+
+            if free_ratio >= 0.9:
+                details.append(f"blocks in free space: {intact_count}/{total_count} (excellent)")
+            elif free_ratio >= 0.5:
+                details.append(f"blocks in free space: {intact_count}/{total_count} (partial)")
+            else:
+                details.append(f"blocks in free space: {intact_count}/{total_count} (low - may be overwritten)")
+        else:
+            scores.append(('free_space', 0.5, 0.40))  # Unknown = neutral
+            details.append("free-space status: unknown (no AGF data)")
+
+        # 2. Extent contiguity (weight: 20%)
+        if len(extents) > 1:
+            sorted_exts = sorted(extents, key=lambda e: e.startoff)
+            gaps = 0
+            for j in range(1, len(sorted_exts)):
+                expected = sorted_exts[j-1].startoff + sorted_exts[j-1].blockcount
+                if sorted_exts[j].startoff != expected:
+                    gaps += 1
+            gap_ratio = 1.0 - (gaps / (len(sorted_exts) - 1))
+            scores.append(('contiguity', max(0, gap_ratio), 0.20))
+            if gaps > 0:
+                details.append(f"extent gaps: {gaps} (fragmented)")
+            else:
+                details.append("extents: contiguous")
+        elif len(extents) == 1:
+            scores.append(('contiguity', 1.0, 0.20))
+            details.append("extents: single extent (contiguous)")
+        else:
+            scores.append(('contiguity', 0.0, 0.20))
+            details.append("extents: none found")
+
+        # 3. File structure detection (weight: 25%)
+        if file_data and len(file_data) > 8:
+            detected_size = self._detect_true_file_size(file_data)
+            if detected_size < len(file_data):
+                # Valid structure found — high confidence
+                scores.append(('structure', 1.0, 0.25))
+                details.append(f"file structure: valid (detected size: {detected_size})")
+            else:
+                scores.append(('structure', 0.5, 0.25))
+                details.append("file structure: no recognized format header")
+        else:
+            scores.append(('structure', 0.0, 0.25))
+            details.append("file structure: no data")
+
+        # 4. Data quality (weight: 15%)
+        if file_data and len(file_data) > 0:
+            # Check if data is all zeros (garbage)
+            sample_size = min(4096, len(file_data))
+            sample = file_data[:sample_size]
+            zero_ratio = sample.count(0) / len(sample)
+            if zero_ratio > 0.99:
+                scores.append(('data_quality', 0.0, 0.15))
+                details.append("data quality: all zeros (likely overwritten)")
+            elif zero_ratio > 0.8:
+                scores.append(('data_quality', 0.3, 0.15))
+                details.append("data quality: mostly zeros")
+            else:
+                scores.append(('data_quality', 1.0, 0.15))
+                details.append("data quality: non-trivial content")
+        else:
+            scores.append(('data_quality', 0.0, 0.15))
+            details.append("data quality: no data")
+
+        # Compute weighted score
+        confidence = sum(score * weight for _, score, weight in scores)
+        confidence = max(0.0, min(1.0, confidence))
+
+        detail_str = "; ".join(details)
+        return confidence, detail_str
 
     # --------------------------------------------------------
     # Deleted File Detection
@@ -1381,6 +1894,21 @@ class XfsParser:
             self.logger.info("Starting full device scan...")
             self.scan_all_inodes()
 
+            # Fragmented recovery: scan AGI unlinked inode lists
+            # for recently-deleted inodes missed by the B+tree walk
+            self.logger.info("Scanning AGI unlinked inode lists...")
+            self._scan_unlinked_inodes()
+
+            # Build free-space block map for integrity/confidence checking
+            self.logger.info("Building free-space block map...")
+            self._build_free_block_set()
+
+            self.logger.info(
+                f"Fragmented recovery stats: "
+                f"{self.fragmented_recovery_stats['unlinked_inodes_found']} unlinked inodes, "
+                f"{self.fragmented_recovery_stats['salvaged_extent_inodes']} salvaged-extent inodes"
+            )
+
             count = 0
             skipped_by_filter = 0
             skipped_not_regular = 0
@@ -1493,6 +2021,15 @@ class XfsParser:
                         'integrity_verified': False,
                         'integrity_details': integrity_details,
                     })
+
+                    # Compute recovery confidence for deleted files
+                    if is_deleted:
+                        confidence, conf_details = self._compute_recovery_confidence(
+                            inode_num, file_data
+                        )
+                        recovered_files[-1]['recovery_confidence'] = round(confidence, 3)
+                        recovered_files[-1]['recovery_details'] = conf_details
+
                     count += 1
 
                 except Exception as e:
