@@ -216,9 +216,13 @@ class FileCarver:
                             
                             if recovered_data:
                                 self._seen_offsets.add(abs_start)
-                                counts[ext] = counts.get(ext, 0) + 1
-                                filename = f"carved_{counts[ext]:04d}.{ext}"
-                                result = self._save_carved_file(filename, recovered_data, ext, abs_start)
+                                # Classify ZIP-based formats (docx, xlsx, pptx, odt)
+                                actual_ext = ext
+                                if ext == 'zip':
+                                    actual_ext = self._classify_zip_content(recovered_data)
+                                counts[actual_ext] = counts.get(actual_ext, 0) + 1
+                                filename = f"carved_{counts[actual_ext]:04d}.{actual_ext}"
+                                result = self._save_carved_file(filename, recovered_data, actual_ext, abs_start)
                                 if result:
                                     carved_files.append(result)
                                 
@@ -418,6 +422,46 @@ class FileCarver:
             return True
         
         return False
+
+    def _classify_zip_content(self, data: bytes) -> str:
+        """
+        Classify ZIP-based content by inspecting internal file paths.
+        
+        DOCX, XLSX, PPTX, and ODT files are all ZIP archives with
+        specific internal directory structures. This method peeks
+        inside the carved ZIP data to determine the actual format.
+        
+        Returns:
+            Actual file extension: 'docx', 'xlsx', 'pptx', 'odt', or 'zip'
+        """
+        import zipfile
+        import io
+        
+        try:
+            with zipfile.ZipFile(io.BytesIO(data), 'r') as zf:
+                names = set(zf.namelist())
+                
+                # DOCX: contains word/document.xml
+                if any(n.startswith('word/') for n in names):
+                    return 'docx'
+                
+                # XLSX: contains xl/workbook.xml or xl/worksheets/
+                if any(n.startswith('xl/') for n in names):
+                    return 'xlsx'
+                
+                # PPTX: contains ppt/presentation.xml or ppt/slides/
+                if any(n.startswith('ppt/') for n in names):
+                    return 'pptx'
+                
+                # ODT/ODS/ODP: contains content.xml + META-INF/manifest.xml
+                if 'content.xml' in names and any(n.startswith('META-INF/') for n in names):
+                    return 'odt'
+                
+        except (zipfile.BadZipFile, Exception):
+            # Not a valid ZIP or corrupted — keep as generic zip
+            pass
+        
+        return 'zip'
 
     def _validate_bmp(self, data: bytes, idx: int) -> bool:
         """Validate a BMP header to avoid false positives from 'BM' occurring in random data."""

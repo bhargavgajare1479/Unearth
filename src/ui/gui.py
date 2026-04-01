@@ -793,12 +793,24 @@ class UnearthGUI(QMainWindow):
         
         # --- File type selection area ---
         # Group the supported types into categories for cleaner UI
+        # DOCX, XLSX, and ZIP are listed separately so users can toggle each
+        # independently. All three use the same PK\x03\x04 carving signature
+        # ('zip'), but the carved files are classified by internal structure.
         type_categories = {
             "Images": ['jpg', 'png', 'gif', 'bmp', 'tiff', 'webp', 'heic'],
-            "Documents": ['pdf', 'zip'],  # zip covers docx/xlsx/pptx
+            "Documents": ['pdf', 'docx', 'xlsx', 'zip'],
             "Audio": ['mp3', 'mp3_id3'],
             "Video": ['mp4', 'avi'],
             "Archives": ['7z', 'rar'],
+        }
+        
+        # Mapping from UI type keys to the actual carver signature key.
+        # DOCX/XLSX/PPTX are all ZIP archives internally, so they share
+        # the 'zip' carver signature.
+        UI_TYPE_TO_CARVER = {
+            'docx': 'zip',
+            'xlsx': 'zip',
+            'pptx': 'zip',
         }
         
         # Container for type checkboxes (disabled when carving is off)
@@ -823,16 +835,14 @@ class UnearthGUI(QMainWindow):
             
             row = QHBoxLayout()
             for t in types:
-                # Clean up display name (remove underscores, show friendly label)
+                # Clean up display name
                 display = t.upper().replace('_', ' ')
-                if t == 'zip':
-                    display = 'ZIP/DOCX/XLSX'  # Clarify that ZIP covers Office formats
-                elif t == 'mp3_id3':
+                if t == 'mp3_id3':
                     display = 'MP3 (ID3)'
                 cb = QCheckBox(display)
                 cb.setChecked(True)
                 cb.setStyleSheet(checkbox_style)
-                cb.setProperty('file_type', t)  # Store the actual type key
+                cb.setProperty('file_type', t)  # Store the UI type key
                 type_checkboxes[t] = cb
                 row.addWidget(cb)
             row.addStretch()
@@ -889,16 +899,21 @@ class UnearthGUI(QMainWindow):
         if not carving_enabled:
             return (False, None)
         
-        # Collect selected file types
-        selected_types = [
-            cb.property('file_type')
-            for cb in type_checkboxes.values()
-            if cb.isChecked()
-        ]
+        # Collect selected file types, mapping UI keys back to carver keys
+        selected_types = []
+        for cb in type_checkboxes.values():
+            if cb.isChecked():
+                ui_type = cb.property('file_type')
+                carver_type = UI_TYPE_TO_CARVER.get(ui_type, ui_type)
+                if carver_type not in selected_types:
+                    selected_types.append(carver_type)
         
         # If all types are selected, pass None (meaning "carve everything")
         # to avoid an unnecessarily long filter list
-        if len(selected_types) == len(type_checkboxes):
+        all_carver_types = set()
+        for t in type_checkboxes.keys():
+            all_carver_types.add(UI_TYPE_TO_CARVER.get(t, t))
+        if set(selected_types) == all_carver_types:
             return (True, None)
         
         # If nothing selected but carving enabled, treat as disabled
